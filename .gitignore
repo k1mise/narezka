@@ -1,0 +1,13 @@
+# секреты и личные данные — никогда в репозиторий
+.env
+assets/client_secret.json
+assets/*.json
+workspace/
+*.db
+*.zip
+
+# служебное
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/

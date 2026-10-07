@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark light">
+<title>narez — нарезка шортсов</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%236c8cff'/%3E%3Cpath d='M9 22V10l14 12V10' stroke='white' stroke-width='3' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<div class="app">
+  <aside class="side">
+    <div class="brand"><span class="logo">n</span><span class="brand-name">narez</span></div>
+    <nav class="nav" id="nav"></nav>
+    <div class="side-foot">
+      <div class="chips" id="health"></div>
+      <button class="btn ghost sm" id="theme" title="Сменить тему">Тема</button>
+    </div>
+  </aside>
+  <main class="main">
+    <header class="top">
+      <h1 id="title"></h1>
+      <div class="top-right">
+        <label class="group-pick" id="group-pick">
+          <span>Группа</span>
+          <select id="group"></select>
+        </label>
+        <div class="chips only-mobile" id="health-m"></div>
+      </div>
+    </header>
+    <section id="page"></section>
+  </main>
+</div>
+<div class="task-pill" id="pill" hidden></div>
+<div class="toasts" id="toasts"></div>
+<dialog id="dlg"></dialog>
+<script src="/static/app.js"></script>
+</body>
+</html>

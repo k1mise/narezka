@@ -1,0 +1,56 @@
+# Настройки narez. Меняй здесь, код трогать не нужно.
+
+[paths]
+workdir = "workspace"          # сюда падают загрузки, транскрипты и готовые клипы
+db = "narez.db"
+
+[whisper]
+model = "small"                # tiny/base/small/medium/large-v3 (больше = точнее, но медленнее)
+device = "auto"                # auto / cpu / cuda
+compute_type = "auto"          # auto / int8 / float16
+language = ""                  # "" = определять автоматически, либо "ru", "en"...
+vocabulary = "GTA 5, Лос-Сантос, Майкл, Тревор, Франклин, дропнуть, селфи, котики"
+
+[llm]                          # локальная модель через Ollama (https://ollama.com)
+host = "http://localhost:11434"
+model = "qwen2.5:7b"           # ollama pull qwen2.5:7b ; для слабого ПК: qwen2.5:3b
+temperature = 0.3
+chunk_minutes = 6             # транскрипт режется на куски, чтобы влезть в контекст
+moments_per_chunk = 3
+num_ctx = 4096
+
+[clips]
+min_seconds = 30
+max_seconds = 60
+max_clips = 6                  # сколько лучших клипов оставить с одного видео
+layout = "blur"                # blur = кадр по центру на размытом фоне, crop = обрезка по центру
+width = 1080
+height = 1920
+crf = 20
+preset = "veryfast"
+
+[subtitles]
+enabled = true
+translate_to = ""              # "" = язык оригинала; иначе "English", "Русский", "Español"...
+font = "Arial"
+font_size = 84
+words_per_line = 4
+margin_bottom = 420
+
+[banner]                       # рекламный баннер: строго контролируемый
+enabled = false
+image = "assets/banner.png"    # PNG (лучше с прозрачностью)
+position = "bottom"            # top / bottom / center
+width_percent = 90             # ширина баннера в % от ширины кадра
+start_at = 3.0                 # на какой секунде клипа появляется
+duration = 6.0                 # сколько секунд висит
+max_per_clip = 1               # жёсткий лимит показов на клип
+margin = 160                   # отступ от края, px
+
+[youtube]
+client_secrets = "assets/client_secret.json"   # OAuth-клиент из Google Cloud (см. README)
+privacy = "unlisted"            # private / unlisted / public. Начни с private, проверь, потом public
+category_id = "22"             # 22 = People & Blogs
+delay_minutes = 10             # задержка между клипами: 1-й сразу, 2-й через час и т.д. (0 = все сразу)
+add_shorts_tag = true          # добавлять #Shorts в описание
+made_for_kids = false
