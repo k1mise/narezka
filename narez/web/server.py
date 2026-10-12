@@ -58,9 +58,12 @@ class CutIn(BaseModel):
     mode: str = "moments"        # moments = интересные моменты, full = всё видео по частям
     length: float = 45.0         # длина части (режим full), секунды
     overlap: float = 2.5         # нахлёст: следующая часть начинается за столько секунд до конца предыдущей
+    audio: str = "ru"            # ru = русская дорожка, если у видео есть дубляж; original = оригинал
 
 
 def cut_args(b: CutIn) -> dict:
+    if b.audio not in ("ru", "original"):
+        raise HTTPException(400, "Звук: ru или original")
     if b.mode not in ("moments", "full"):
         raise HTTPException(400, "Режим нарезки: moments или full")
     if b.mode == "full":
@@ -68,7 +71,7 @@ def cut_args(b: CutIn) -> dict:
             raise HTTPException(400, "Длина клипа — от 5 до 180 секунд")
         if not 0 <= b.overlap <= min(30, b.length - 5):
             raise HTTPException(400, "Нахлёст — от 0 секунд и не больше длины клипа минус 5 секунд")
-    return {"mode": b.mode, "length": b.length, "overlap": b.overlap}
+    return {"mode": b.mode, "length": b.length, "overlap": b.overlap, "audio": b.audio}
 
 
 class ProcessIn(CutIn):

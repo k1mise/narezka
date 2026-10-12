@@ -191,13 +191,13 @@ async function onTaskDone(t) {
 function startTracking(task) { S.tracked.add(task.id); S.trackId = task.id; S.tasks = [task, ...S.tasks.filter(t => t.id !== task.id)]; renderPill(); }
 
 /* ---------- режим нарезки ---------- */
-const cutDefaults = {mode: "moments", length: 45, overlap: 2.5};
+const cutDefaults = {mode: "moments", length: 45, overlap: 2.5, audio: "ru"};
 function cutState() {
   if (!S.cut) { try { S.cut = {...cutDefaults, ...JSON.parse(localStorage.getItem("cut") || "{}")}; } catch (e) { S.cut = {...cutDefaults}; } }
   return S.cut;
 }
 const cutSave = () => { try { localStorage.setItem("cut", JSON.stringify(S.cut)); } catch (e) {} };
-const cutPayload = () => { const c = cutState(); return {mode: c.mode, length: +c.length || 45, overlap: c.overlap === "" ? 2.5 : +c.overlap}; };
+const cutPayload = () => { const c = cutState(); return {mode: c.mode, length: +c.length || 45, overlap: c.overlap === "" ? 2.5 : +c.overlap, audio: c.audio === "original" ? "original" : "ru"}; };
 function cutBox() {
   const c = cutState();
   const num = (key, step, min, max) => { const i = h("input", {type: "number", step: String(step), min: String(min), max: String(max), value: String(c[key]), style: {width: "90px"}});
@@ -210,7 +210,9 @@ function cutBox() {
   const seg = h("div", {class: "seg"}, [["moments", "Интересные моменты"], ["full", "Нарезать целиком"]].map(([k, t]) =>
     h("button", {class: "", "data-k": k, onclick: () => { c.mode = k; cutSave(); draw(); }}, t)));
   draw();
-  return h("div", {style: {marginTop: "12px"}}, seg, params);
+  const aud = h("select", {style: {width: "auto"}}, [["ru", "Звук: русский (если есть дубляж)"], ["original", "Звук: оригинал"]].map(([k, t]) => h("option", {value: k}, t)));
+  aud.value = c.audio === "original" ? "original" : "ru"; aud.onchange = () => { c.audio = aud.value; cutSave(); };
+  return h("div", {style: {marginTop: "12px"}}, h("div", {class: "row", style: {gap: "12px"}}, seg, aud), params);
 }
 
 /* ---------- панель ---------- */

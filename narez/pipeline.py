@@ -83,7 +83,7 @@ class _Timer:
 
 
 def run(url: str, cfg: dict, db: dbm.DB, group_id: int | None = None, log=print, test: bool = False,
-        mode: str = "moments", length: float = 45.0, overlap: float = 2.5):
+        mode: str = "moments", length: float = 45.0, overlap: float = 2.5, audio: str = "ru"):
     """Ссылка -> скачивание -> транскрипт -> моменты -> готовые вертикальные клипы. Возвращает (job_id, [clips]).
     mode="full": без выбора моментов — всё видео режется подряд на части длиной length с нахлёстом overlap."""
     if mode == "full":
@@ -91,7 +91,7 @@ def run(url: str, cfg: dict, db: dbm.DB, group_id: int | None = None, log=print,
     workdir: Path = cfg["paths"]["workdir"]
     tm = _Timer(log)
     log("Скачиваю видео...")
-    video, title = download(url, workdir, log, cfg)
+    video, title = download(url, workdir, log, cfg, audio=audio)
     log(f"Скачано: {title}")
     tm.lap("скачивание")
 

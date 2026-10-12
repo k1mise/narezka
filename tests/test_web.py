@@ -506,7 +506,10 @@ def test_cut_params_validation(env, monkeypatch):
     r = c.post("/api/process", json={**base, "mode": "full", "length": 30, "overlap": 4})
     assert r.status_code == 200
     wait_task(c, r.json())
-    assert got == [{"mode": "full", "length": 30.0, "overlap": 4.0}]
+    assert got == [{"mode": "full", "length": 30.0, "overlap": 4.0, "audio": "ru"}]
+    assert c.post("/api/process", json={**base, "audio": "de"}).status_code == 400
+    wait_task(c, c.post("/api/process", json={**base, "audio": "original"}).json())
+    assert got[-1]["audio"] == "original"
 
 
 @pytest.mark.skipif(not shutil.which("ffmpeg"), reason="нужен ffmpeg")

@@ -109,7 +109,21 @@ def glob_escape(s: str) -> str:
     return glob.escape(s)
 
 
-def download(url: str, workdir: Path, log=print, cfg: dict | None = None) -> tuple[Path, str]:
+def has_russian_audio(info: dict) -> bool:
+    """Есть ли у видео отдельная русская звуковая дорожка (дубляж / автодубляж YouTube)."""
+    return any(str(f.get("language") or "").lower().startswith("ru") and f.get("vcodec") in (None, "none")
+               for f in info.get("formats") or [])
+
+
+def format_for(audio: str, height: int, has_ru: bool) -> str:
+    """Строка формата yt-dlp. audio="ru": русская дорожка, если она есть; иначе — оригинал."""
+    base = f"bv*[height<={height}]+ba/b[height<={height}]/b"
+    if audio == "ru" and has_ru:
+        return f"bv*[height<={height}]+ba[language^=ru]/{base}"
+    return base
+
+
+def download(url: str, workdir: Path, log=print, cfg: dict | None = None, audio: str = "ru") -> tuple[Path, str]:
     """Возвращает (путь к видео, название). Источник: ссылка (yt-dlp: YouTube и ~1000 сайтов, прямые ссылки на файлы,
     страницы с видеоплеером) или путь к локальному видеофайлу (скачивание пропускается).
     Файл называется по названию видео («Как дрессировать щенка.mp4»)."""
@@ -160,6 +174,13 @@ def download(url: str, workdir: Path, log=print, cfg: dict | None = None) -> tup
                 if not entries:
                     raise SourceError("В плейлисте нет доступных видео")
                 info = entries[0]
+            ru = has_russian_audio(info)
+            fmt = format_for(audio, h, ru)
+            ydl.params["format"] = fmt
+            ydl.format_selector = ydl.build_format_selector(fmt)  # селектор строится при создании YoutubeDL — пересобираем
+            if audio == "ru":
+                log("Нашёл русскую звуковую дорожку — качаю с ней." if ru else
+                    "Русской дорожки у этого видео нет — качаю оригинал.")
             base = _pick_path(out_dir, info.get("title") or "", str(info.get("id") or "video"))
             ydl.params["outtmpl"] = {"default": str(out_dir / (base + ".%(ext)s"))}
             info = ydl.process_ie_result(info, download=True)

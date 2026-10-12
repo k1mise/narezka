@@ -92,3 +92,30 @@ def test_download_named_by_title_and_cached(tmp_path):
         assert path2 == path and len(list((tmp_path / "wd" / "downloads").glob("*.mp4"))) == 1
     finally:
         httpd.shutdown()
+
+
+def test_russian_audio_choice():
+    from narez.downloader import format_for, has_russian_audio
+    dubbed = {"formats": [{"language": "en", "vcodec": "none"}, {"language": "ru-RU", "vcodec": "none"}, {"language": None, "vcodec": "avc1"}]}
+    plain = {"formats": [{"language": "en", "vcodec": "none"}, {"language": "ru", "vcodec": "avc1"}]}  # «ru» у видеоформата не считается
+    assert has_russian_audio(dubbed) and not has_russian_audio(plain) and not has_russian_audio({})
+    assert "ba[language^=ru]" in format_for("ru", 1080, True)
+    assert "language" not in format_for("ru", 1080, False)      # дорожки нет — обычный формат (оригинал)
+    assert "language" not in format_for("original", 1080, True)
+    assert format_for("ru", 720, True).endswith("/b[height<=720]/b")
+
+
+def test_format_selector_rebuilt_picks_russian_track():
+    """Проверка на настоящем yt_dlp: после смены формата выбирается русская звуковая дорожка, а без неё — обычная."""
+    import yt_dlp
+    from narez.downloader import format_for
+    fmts = [{"format_id": "v", "ext": "mp4", "vcodec": "avc1", "acodec": "none", "height": 720, "url": "u", "protocol": "https"},
+            {"format_id": "a_ru", "ext": "m4a", "vcodec": "none", "acodec": "mp4a", "language": "ru", "url": "u", "protocol": "https", "language_preference": -1},
+            {"format_id": "a_en", "ext": "m4a", "vcodec": "none", "acodec": "mp4a", "language": "en", "url": "u", "protocol": "https", "language_preference": 10}]
+    with yt_dlp.YoutubeDL({"quiet": True}) as ydl:
+        def pick(fmt):
+            sel = ydl.build_format_selector(fmt)
+            ctx = {"formats": fmts, "incomplete_formats": False}
+            return [f["format_id"] for f in next(iter(sel(ctx))).get("requested_formats", [])]
+        assert pick(format_for("original", 1080, True)) == ["v", "a_en"]
+        assert pick(format_for("ru", 1080, True)) == ["v", "a_ru"]
