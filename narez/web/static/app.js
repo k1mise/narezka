@@ -190,6 +190,29 @@ async function onTaskDone(t) {
 }
 function startTracking(task) { S.tracked.add(task.id); S.trackId = task.id; S.tasks = [task, ...S.tasks.filter(t => t.id !== task.id)]; renderPill(); }
 
+/* ---------- режим нарезки ---------- */
+const cutDefaults = {mode: "moments", length: 45, overlap: 2.5};
+function cutState() {
+  if (!S.cut) { try { S.cut = {...cutDefaults, ...JSON.parse(localStorage.getItem("cut") || "{}")}; } catch (e) { S.cut = {...cutDefaults}; } }
+  return S.cut;
+}
+const cutSave = () => { try { localStorage.setItem("cut", JSON.stringify(S.cut)); } catch (e) {} };
+const cutPayload = () => { const c = cutState(); return {mode: c.mode, length: +c.length || 45, overlap: c.overlap === "" ? 2.5 : +c.overlap}; };
+function cutBox() {
+  const c = cutState();
+  const num = (key, step, min, max) => { const i = h("input", {type: "number", step: String(step), min: String(min), max: String(max), value: String(c[key]), style: {width: "90px"}});
+    i.oninput = () => { c[key] = i.value; cutSave(); }; return i; };
+  const params = h("div", {class: "row", style: {marginTop: "10px", gap: "16px", alignItems: "end"}},
+    h("label", {class: "muted small"}, "Длина клипа, с", h("div", {}, num("length", 1, 5, 180))),
+    h("label", {class: "muted small"}, "Нахлёст, с", h("div", {}, num("overlap", 0.5, 0, 30))),
+    h("div", {class: "grow muted small"}, "Каждый следующий клип начинается с последних секунд предыдущего. Видео режется подряд, целиком, без выбора моментов — заголовки «Часть N/M» можно поменять в редакторе."));
+  const draw = () => { params.style.display = c.mode === "full" ? "" : "none"; seg.querySelectorAll("button").forEach(b => b.classList.toggle("on", b.dataset.k === c.mode)); };
+  const seg = h("div", {class: "seg"}, [["moments", "Интересные моменты"], ["full", "Нарезать целиком"]].map(([k, t]) =>
+    h("button", {class: "", "data-k": k, onclick: () => { c.mode = k; cutSave(); draw(); }}, t)));
+  draw();
+  return h("div", {style: {marginTop: "12px"}}, seg, params);
+}
+
 /* ---------- панель ---------- */
 const STEPS = [["Скачивание", /Скачиваю|Скачано/], ["Транскрипция и выбор моментов", /транскри|Whisper|моментов|LLM|Выбрано/i],
   ["Рендер клипов", /Рендерю клип/], ["Готово", /Готово!/]];
@@ -213,12 +236,13 @@ function pagePanel(page) {
   const startBtn = h("button", {class: "btn primary", id: "start", onclick: start}, "Нарезать");
   async function start() {
     try {
-      const t = await api("POST", "/api/process", {url: url.value, group_id: S.gid, test: testBox.checked});
+      const t = await api("POST", "/api/process", {url: url.value, group_id: S.gid, test: testBox.checked, ...cutPayload()});
       startTracking(t); url.value = ""; toast("Запустил нарезку"); updateRunBox();
     } catch (e) { fail(e); }
   }
   page.append(h("div", {class: "card"}, h("h2", {}, "Новое видео", h("small", {}, `группа «${g.name}»`)),
     h("div", {class: "hero-input"}, url, startBtn),
+    cutBox(),
     h("label", {class: "check"}, testBox, h("span", {}, "Тестовый прогон — клипы сохранятся в папку тестов и не будут публиковаться"))));
   page.append(h("div", {id: "runbox"}));
   page.append(filesCard());
@@ -294,7 +318,7 @@ function filesCard() {
         x.in_editor ? h("span", {class: "badge acc"}, "в редакторе") : null,
         tab === "clips" || (tab === "test" && /(^|\/)job\d+\//.test(x.name))
           ? h("button", {class: "btn sm", disabled: x.in_editor, onclick: () => act("to-editor", x)}, "В редактор")
-          : h("button", {class: "btn sm primary", onclick: () => act("slice", x)}, S.testMode ? "Нарезать (тест)" : "Нарезать"),
+          : h("button", {class: "btn sm primary", onclick: () => act("slice", x)}, (S.testMode ? "Нарезать (тест)" : "Нарезать") + (cutState().mode === "full" ? " целиком" : "")),
         h("button", {class: "btn sm", onclick: () => ask("Переименовать видео", "Новое название файла (расширение сохранится)", x.name.split("/").pop().replace(/\.[^.]+$/, ""), "Переименовать", async v => {
           try { await api("POST", "/api/files/rename", {folder: tab, name: x.name, new_name: v}); toast("Переименовано"); await loadClips(); renderNav(); draw(); } catch (e) { fail(e); } })}, "Переименовать"),
         h("button", {class: "btn sm danger", title: "Удалить файл с диска", onclick: () => confirmBox("Удалить видео?", `«${x.name}» (${fmtSize(x.size)}) будет удалено с диска без возможности восстановления.` + (x.in_editor ? " Клип пропадёт и из редактора." : ""), "Удалить", async () => {
@@ -307,7 +331,7 @@ function filesCard() {
   };
   async function act(kind, x) {
     try {
-      const payload = {folder: tab, name: x.name, group_id: S.gid, test: !!S.testMode};
+      const payload = {folder: tab, name: x.name, group_id: S.gid, test: !!S.testMode, ...cutPayload()};
       const r = await api("POST", "/api/files/" + kind, payload);
       if (kind === "slice") { startTracking(r); toast("Запустил нарезку"); }
       else { toast("Клип добавлен в редактор"); await loadClips(); S.cid = r.id; renderNav(); draw(); }

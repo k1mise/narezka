@@ -253,7 +253,7 @@ def test_folders_files_slice_and_to_editor(env, monkeypatch):
     assert c.get("/api/files", params={"folder_key": "clips"}).json()[0]["in_editor"] is True
     # нарезка из файла исходников (тестовый режим)
     seen = {}
-    monkeypatch.setattr("narez.web.server.run_pipeline", lambda src, cfg_, db_, gid, log, test=False: seen.update(src=src, test=test) or (1, []))
+    monkeypatch.setattr("narez.web.server.run_pipeline", lambda src, cfg_, db_, gid, log, test=False, **kw: seen.update(src=src, test=test, **kw) or (1, []))
     t = c.post("/api/files/slice", json={"folder": "sources", "name": "src.mp4", "group_id": g, "test": True}).json()
     assert wait_task(c, t)["status"] == "done"
     assert seen["test"] is True and seen["src"].endswith("src.mp4")
@@ -480,3 +480,49 @@ def test_load_env(tmp_path, monkeypatch):
     import os
     assert os.environ["NZ_A"] == "1" and os.environ["NZ_B"] == "x y"
     assert load_env(tmp_path / "nope") is False
+
+
+def test_plan_parts_overlap_and_tail():
+    from narez.pipeline import plan_parts
+    p = plan_parts(100, 45, 2.5)
+    assert p == [(0, 45), (42.5, 87.5), (85, 100)]
+    assert all(b[0] == a[1] - 2.5 for a, b in zip(p, p[1:]))   # каждая часть начинается за 2.5 с до конца предыдущей
+    assert plan_parts(30, 45, 2.5) == [(0, 30)]                  # короткое видео — одна часть
+    assert plan_parts(88, 45, 2.5) == [(0, 45), (42.5, 88)]      # хвост меньше 3 с нового материала присоединяется
+    assert plan_parts(60, 20, 0) == [(0, 20), (20, 40), (40, 60)]
+    with pytest.raises(ValueError):
+        plan_parts(60, 10, 10)
+
+
+def test_cut_params_validation(env, monkeypatch):
+    c, cfg, db, app = env
+    g = db.add_group("g")
+    got = []
+    monkeypatch.setattr("narez.web.server.run_pipeline", lambda src, cfg_, db_, gid, log, test=False, **kw: got.append(kw) or (1, []))
+    base = {"url": "https://a.b/c.mp4", "group_id": g}
+    assert c.post("/api/process", json={**base, "mode": "x"}).status_code == 400
+    assert c.post("/api/process", json={**base, "mode": "full", "length": 2}).status_code == 400
+    assert c.post("/api/process", json={**base, "mode": "full", "length": 30, "overlap": 30}).status_code == 400
+    r = c.post("/api/process", json={**base, "mode": "full", "length": 30, "overlap": 4})
+    assert r.status_code == 200
+    wait_task(c, r.json())
+    assert got == [{"mode": "full", "length": 30.0, "overlap": 4.0}]
+
+
+@pytest.mark.skipif(not shutil.which("ffmpeg"), reason="нужен ffmpeg")
+def test_full_mode_pipeline_renders_all_parts(env, tmp_path):
+    c, cfg, db, app = env
+    from narez import banner as bn, pipeline
+    src = tmp_path / "long.mp4"
+    subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", "testsrc=size=320x180:rate=15:duration=20",
+                    "-f", "lavfi", "-i", "sine=frequency=300:duration=20", "-shortest", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                    "-c:a", "aac", str(src)], check=True)
+    cfg["subtitles"]["enabled"] = False
+    cfg["clips"].update(width=270, height=480, preset="ultrafast")
+    g = db.add_group("g")
+    job, clips = pipeline.run(str(src), cfg, db, g, lambda m: None, mode="full", length=8, overlap=2.5)
+    assert len(clips) == 3
+    durs = [bn.probe(c_["path"])["duration"] for c_ in clips]
+    assert [round(d) for d in durs] == [8, 8, 9]
+    assert [c_["title"] for c_ in clips] == [f"long — часть {i}/3" for i in (1, 2, 3)]
+    assert (clips[0]["start"], clips[1]["start"], clips[2]["start"]) == (0, 5.5, 11)

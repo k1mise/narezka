@@ -54,3 +54,9 @@ category_id = "22"             # 22 = People & Blogs
 delay_minutes = 10             # задержка между клипами: 1-й сразу, 2-й через час и т.д. (0 = все сразу)
 add_shorts_tag = true          # добавлять #Shorts в описание
 made_for_kids = false
+
+[download]
+max_height = 1080
+proxy = ""
+cookies_from_browser = ""
+cookies_file = "D:/narez/assets/cookies.txt"

@@ -54,7 +54,24 @@ class AccountIn(BaseModel):
     label: str = ""
 
 
-class ProcessIn(BaseModel):
+class CutIn(BaseModel):
+    mode: str = "moments"        # moments = интересные моменты, full = всё видео по частям
+    length: float = 45.0         # длина части (режим full), секунды
+    overlap: float = 2.5         # нахлёст: следующая часть начинается за столько секунд до конца предыдущей
+
+
+def cut_args(b: CutIn) -> dict:
+    if b.mode not in ("moments", "full"):
+        raise HTTPException(400, "Режим нарезки: moments или full")
+    if b.mode == "full":
+        if not 5 <= b.length <= 180:
+            raise HTTPException(400, "Длина клипа — от 5 до 180 секунд")
+        if not 0 <= b.overlap <= min(30, b.length - 5):
+            raise HTTPException(400, "Нахлёст — от 0 секунд и не больше длины клипа минус 5 секунд")
+    return {"mode": b.mode, "length": b.length, "overlap": b.overlap}
+
+
+class ProcessIn(CutIn):
     url: str
     group_id: int
     test: bool = False
@@ -86,7 +103,7 @@ class RenameIn(BaseModel):
     new_name: str
 
 
-class FileIn(BaseModel):
+class FileIn(CutIn):
     folder: str
     name: str
     group_id: int
@@ -337,11 +354,13 @@ def create_app(cfg: dict | None = None) -> FastAPI:
         except SourceError as e:
             raise HTTPException(400, str(e)) from None
 
+        cut = cut_args(body)
+
         def fn(log):
             db2 = DB(cfg["paths"]["db"], init=False)
-            job_id, clips = run_pipeline(url, eff_cfg(db2, log), db2, body.group_id, log, test=body.test)
+            job_id, clips = run_pipeline(url, eff_cfg(db2, log), db2, body.group_id, log, test=body.test, **cut)
             return {"job_id": job_id, "clips": len(clips)}
-        return started("process", f"{'Тест: ' if body.test else 'Нарезка: '}{Path(url).name if not url.startswith('http') else url}", fn, exclusive=True)
+        return started("process", f"{'Тест: ' if body.test else 'Нарезка целиком: ' if body.mode == 'full' else 'Нарезка: '}{Path(url).name if not url.startswith('http') else url}", fn, exclusive=True)
 
     @app.get("/api/tasks")
     def task_list():
@@ -695,10 +714,11 @@ def create_app(cfg: dict | None = None) -> FastAPI:
         """Нарезать клипы из видеофайла, лежащего в папке исходников или тестов."""
         need_group(d, body.group_id)
         src = safe_file(body.folder, body.name)
+        cut = cut_args(body)
 
         def fn(log):
             db2 = DB(cfg["paths"]["db"], init=False)
-            job_id, clips_ = run_pipeline(str(src), eff_cfg(db2, log), db2, body.group_id, log, test=body.test)
+            job_id, clips_ = run_pipeline(str(src), eff_cfg(db2, log), db2, body.group_id, log, test=body.test, **cut)
             return {"job_id": job_id, "clips": len(clips_)}
         return started("process", f"{'Тест: ' if body.test else 'Нарезка: '}{src.name}", fn, exclusive=True)
 
