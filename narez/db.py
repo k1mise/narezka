@@ -121,6 +121,17 @@ class DB:
             (group_id, platform, label, json.dumps(credentials or {})))
         self.c.commit()
 
+    def account_credentials(self, account_id: int) -> dict:
+        r = self.account(account_id)
+        try:
+            return json.loads(r["credentials"] or "{}") if r else {}
+        except ValueError:
+            return {}
+
+    def set_account_credentials(self, account_id: int, creds: dict):
+        self.c.execute("UPDATE accounts SET credentials=? WHERE id=?", (json.dumps(creds), account_id))
+        self.c.commit()
+
     def accounts(self, group_id: int):
         return self.c.execute("SELECT * FROM accounts WHERE group_id=?", (group_id,)).fetchall()
 

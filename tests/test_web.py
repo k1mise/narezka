@@ -325,7 +325,7 @@ def test_login_cancel_and_account_removal(env, monkeypatch):
         def token_path(self, aid):
             return cfg["paths"]["workdir"] / f"tok{aid}.json"
 
-        def authorize(self, aid, port=0, timeout=300):
+        def authorize(self, aid, port=0, timeout=300, client=None):
             srv = http.server.HTTPServer(("127.0.0.1", port), http.server.SimpleHTTPRequestHandler)
             srv.timeout = 15
             started["ok"] = True
@@ -529,3 +529,141 @@ def test_full_mode_pipeline_renders_all_parts(env, tmp_path):
     assert [round(d) for d in durs] == [8, 8, 9]
     assert [c_["title"] for c_ in clips] == [f"long — часть {i}/3" for i in (1, 2, 3)]
     assert (clips[0]["start"], clips[1]["start"], clips[2]["start"]) == (0, 5.5, 11)
+
+
+def test_start_seconds_percent_and_legacy_json():
+    from narez import banner as bn
+    assert bn.start_seconds({"start": 4}, 40) == 4
+    assert bn.start_seconds({"start_mode": "percent", "start_percent": 25}, 40) == 10
+    assert bn.start_seconds({"start_mode": "percent", "start_percent": 500}, 40) == 40
+    assert bn.start_seconds({"start_mode": "percent", "start_percent": -5}, 40) == 0
+    one = {"path": "a.png", "start": 1}
+    assert bn.specs_from_json(bn.specs_to_json([one])) == [one]        # один — словарь, как в старых записях
+    assert len(bn.specs_from_json(bn.specs_to_json([one, one]))) == 2
+    assert bn.specs_from_json('{"path": "a.png"}')[0]["path"] == "a.png"
+    assert bn.specs_from_json("") == [] and bn.specs_to_json([]) == ""
+
+
+def _png(path, color="red"):
+    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i", f"color=c={color}:s=600x200",
+                    "-frames:v", "1", str(path)], check=True)
+
+
+def test_multi_banners_api_roundtrip_limit_and_presets(env):
+    c, cfg, db, _ = env
+    g = db.add_group("g")
+    cid = add_clip(db, cfg, g)
+    bdir = cfg["paths"]["workdir"] / "banners"
+    bdir.mkdir(exist_ok=True)
+    _png(bdir / "a.png")
+    _png(bdir / "b.png", "blue")
+    r = c.patch(f"/api/clips/{cid}", json={"banners": [
+        {"name": "a.png", "start_mode": "percent", "start_percent": 50, "duration": 3},
+        {"name": "b.png", "start": 2, "duration": 2}]})
+    assert r.status_code == 200
+    j = r.json()
+    assert len(j["banners"]) == 2 and j["banner"]["name"] == "a.png"
+    assert j["banners"][0]["start_mode"] == "percent" and j["banners"][0]["start_percent"] == 50
+    assert c.get(f"/api/groups/{g}/clips").json()[0]["banners"][1]["name"] == "b.png"
+    # неизвестный баннер в списке
+    assert c.patch(f"/api/clips/{cid}", json={"banners": [{"name": "нет.png"}]}).status_code == 400
+    # лимит
+    cfg["banner"]["max_banners"] = 2
+    three = [{"name": "a.png"}, {"name": "b.png"}, {"name": "a.png"}]
+    assert c.patch(f"/api/clips/{cid}", json={"banners": three}).status_code == 400
+    # убрать все
+    assert c.patch(f"/api/clips/{cid}", json={"banners": []}).json()["banners"] == []
+    # пресет с несколькими баннерами
+    p = c.post("/api/presets", json={"name": "два", "banners": [{"name": "a.png"}, {"name": "b.png", "start": 5}]}).json()
+    assert len(p["banners"]) == 2
+    out = c.post(f"/api/presets/{p['id']}/apply", json={"clip_ids": [cid]}).json()
+    assert [b["name"] for b in out[0]["banners"]] == ["a.png", "b.png"]
+
+
+@pytest.mark.skipif(not shutil.which("ffmpeg"), reason="нет ffmpeg")
+def test_apply_two_banners_real_render(env, tmp_path):
+    from narez import banner as bn
+    probe = bn.probe
+    c, cfg, db, _ = env
+    cfg["clips"]["preset"] = "ultrafast"
+    base = tmp_path / "base.mp4"
+    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i", "testsrc=size=1080x1920:rate=25",
+                    "-f", "lavfi", "-i", "sine=frequency=440", "-t", "10", "-c:v", "libx264", "-c:a", "aac",
+                    "-pix_fmt", "yuv420p", str(base)], check=True)
+    pa, pb = tmp_path / "a.png", tmp_path / "b.png"
+    _png(pa), _png(pb, "blue")
+    s1 = bn.normalize_spec({**bn.default_spec(cfg, pa), "start_mode": "percent", "start_percent": 20, "duration": 2,
+                            "pause": True}, cfg)
+    s2 = bn.normalize_spec({**bn.default_spec(cfg, pb), "start": 7, "duration": 2}, cfg)
+    out = tmp_path / "out.mp4"
+    bn.apply_banners(base, out, [s2, s1], cfg, log=lambda *_: None)
+    assert out.is_file()
+    # пауза первого баннера удлиняет ролик на его длительность (≈ +2 с)
+    assert probe(out)["duration"] > probe(base)["duration"] + 1.5
+
+
+def _green_banner(path, bg="0x00b140", w=1280, h=720, dur=3):
+    """Видео-баннер: красный прямоугольник 300×200 по центру однотонного фона, со звуком."""
+    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i", f"color=c={bg}:s={w}x{h}:r=25:d={dur}",
+                    "-f", "lavfi", "-i", f"color=c=red:s=300x200:r=25:d={dur}", "-f", "lavfi", "-i", f"sine=d={dur}",
+                    "-filter_complex", "[0][1]overlay=(W-w)/2:(H-h)/2[v]", "-map", "[v]", "-map", "2:a",
+                    "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", str(path)], check=True)
+
+
+@pytest.mark.skipif(not shutil.which("ffmpeg"), reason="нет ffmpeg")
+def test_chroma_key_detect_crop_and_min_area(env, tmp_path):
+    from narez import banner as bn
+    c, cfg, db, _ = env
+    gs = tmp_path / "gs.mp4"
+    _green_banner(gs)
+    key = bn.detect_key(gs)
+    assert key and key.startswith("#00")
+    x0, y0, x1, y1 = bn.content_box(gs, key)
+    assert 0.33 < x0 < 0.4 and 0.6 < x1 < 0.67 and 0.3 < y0 < 0.38
+    sp = bn.normalize_spec({"path": str(gs)}, cfg)
+    assert sp["chroma"] is True and sp["chroma_color"] == key              # включается сам
+    info = bn.probe(gs)
+    w, h, frac, ok = bn.geometry(sp, info, cfg)
+    assert w <= 1080 and h <= 1920 and ok and frac >= 0.25                 # растянут до ≥25% экрана, но в кадре
+    assert bn.geometry({**sp, "chroma": False}, info, cfg)[2] < frac        # без хромакея кадр с фоном занимает меньше видимого
+    assert "вырезан" in bn.describe(sp, cfg)
+    # выключенный хромакей и чужой цвет не ломают разбор параметров
+    assert bn.normalize_spec({"path": str(gs), "chroma": False, "chroma_color": "bad"}, cfg)["chroma"] is False
+    assert bn.normalize_spec({"path": str(gs), "chroma_color": "bad"}, cfg)["chroma_color"] == key
+    # обычная картинка/видео без однотонного зелёного фона — хромакей не включается
+    plain = tmp_path / "plain.mp4"
+    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i", "testsrc=size=640x360:rate=25:d=2",
+                    "-c:v", "libx264", "-pix_fmt", "yuv420p", str(plain)], check=True)
+    assert bn.detect_key(plain) is None and bn.normalize_spec({"path": str(plain)}, cfg)["chroma"] is False
+    # API библиотеки сообщает цвет фона и рамку содержимого
+    shutil.copy(gs, cfg["paths"]["workdir"] / "banners" / "gs.mp4") if (cfg["paths"]["workdir"] / "banners").exists() else None
+    (cfg["paths"]["workdir"] / "banners").mkdir(exist_ok=True)
+    shutil.copy(gs, cfg["paths"]["workdir"] / "banners" / "gs.mp4")
+    lib = {b["name"]: b for b in c.get("/api/banners").json()}
+    assert lib["gs.mp4"]["key"] == key and len(lib["gs.mp4"]["box"]) == 4
+
+
+@pytest.mark.skipif(not shutil.which("ffmpeg"), reason="нет ffmpeg")
+def test_chroma_key_render_makes_background_transparent(env, tmp_path):
+    from narez import banner as bn
+    c, cfg, db, _ = env
+    cfg["clips"]["preset"] = "ultrafast"
+    gs, base = tmp_path / "gs.mp4", tmp_path / "base.mp4"
+    _green_banner(gs, dur=2)
+    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i", "color=c=0x2020a0:s=1080x1920:r=25:d=4",
+                    "-f", "lavfi", "-i", "sine", "-t", "4", "-c:v", "libx264", "-c:a", "aac", "-pix_fmt", "yuv420p", str(base)], check=True)
+
+    def frame_px(src, x, y):
+        r = subprocess.run(["ffmpeg", "-v", "error", "-ss", "1.5", "-i", str(src), "-frames:v", "1", "-vf", f"crop=2:2:{x}:{y}",
+                            "-f", "rawvideo", "-pix_fmt", "rgb24", "-"], capture_output=True, check=True)
+        return tuple(r.stdout[:3])
+
+    for chroma in (True, False):
+        out = tmp_path / f"out{chroma}.mp4"
+        bn.apply_banner(base, out, bn.normalize_spec({"path": str(gs), "start": 0.5, "chroma": chroma}, cfg), cfg, log=lambda *_: None)
+        centre, edge = frame_px(out, 540, 960), frame_px(out, 20, 960)
+        assert centre[0] > 200 and centre[1] < 60                      # красный объект баннера виден
+        if chroma:
+            assert edge[2] > 100 and edge[1] < 80                      # на месте фона — исходный синий кадр, зелёного нет
+        else:
+            assert edge[1] > 120 and edge[2] < 100                     # без хромакея фон баннера остаётся зелёным

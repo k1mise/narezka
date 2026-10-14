@@ -180,3 +180,52 @@ def test_oauth_local_callback_and_cancel():
     t = threading.Thread(target=run); t.start(); time.sleep(0.5)
     urllib.request.urlopen(f"http://127.0.0.1:{port}/?error=cancelled").read()
     t.join(); assert isinstance(out["e"], OAuthError) and "отменён" in str(out["e"])
+
+
+def test_youtube_own_keys_per_account(env, monkeypatch):
+    c, cfg, db, app = env
+    from narez.publishers.youtube import YouTubePublisher
+    for k in ("YOUTUBE_CLIENT_ID", "YOUTUBE_CLIENT_SECRET"):
+        monkeypatch.delenv(k, raising=False)
+    g = db.add_group("g"); db.set_account(g, "youtube", "yt"); db.set_account(g, "tiktok", "tt")
+    byp = {a["platform"]: a["id"] for a in db.accounts(g)}
+    yt, tt = byp["youtube"], byp["tiktok"]
+    ok_id = "123-abc.apps.googleusercontent.com"
+    assert c.put(f"/api/accounts/{yt}/keys", json={"client_id": ok_id}).status_code == 400            # нужны оба поля
+    assert c.put(f"/api/accounts/{yt}/keys", json={"client_id": "oops", "client_secret": "s"}).status_code == 400
+    assert c.put(f"/api/accounts/{tt}/keys", json={"client_id": ok_id, "client_secret": "s"}).status_code == 400
+    assert c.put("/api/accounts/999/keys", json={}).status_code == 404
+    assert c.put(f"/api/accounts/{yt}/keys", json={"client_id": f" {ok_id} ", "client_secret": " GOCSPX-x "}).status_code == 200
+    acc = next(a for a in c.get("/api/groups").json()[0]["accounts"] if a["id"] == yt)
+    assert acc["has_keys"] and "GOCSPX" not in json.dumps(c.get("/api/groups").json())              # секрет наружу не отдаётся
+    seen = {}
+
+    def fake_auth(self, account_id, port=0, timeout=300, client=None):
+        seen.update(client=client, cfg=self.client_config(client))
+        self.token_path(account_id).write_text("{}")
+        return "x"
+    monkeypatch.setattr(YouTubePublisher, "authorize", fake_auth)
+    assert wait_task(c, c.post(f"/api/accounts/{yt}/login").json())["status"] == "done"
+    assert seen["client"] == {"client_id": ok_id, "client_secret": "GOCSPX-x"}
+    assert seen["cfg"]["installed"]["client_id"] == ok_id and seen["cfg"]["installed"]["token_uri"].startswith("https://")
+    # сброс: снова общие ключи; без файла и .env понятная ошибка
+    assert c.put(f"/api/accounts/{yt}/keys", json={}).status_code == 200
+    assert not next(a for a in c.get("/api/groups").json()[0]["accounts"] if a["id"] == yt)["has_keys"]
+    import pytest as _p
+    with _p.raises(FileNotFoundError, match="Ключи"):
+        YouTubePublisher(cfg).client_config(None)
+    monkeypatch.setenv("YOUTUBE_CLIENT_ID", "e.apps.googleusercontent.com"); monkeypatch.setenv("YOUTUBE_CLIENT_SECRET", "es")
+    assert YouTubePublisher(cfg).client_config(None)["installed"]["client_secret"] == "es"
+    assert YouTubePublisher(cfg).client_config({"client_id": ok_id, "client_secret": "own"})["installed"]["client_secret"] == "own"
+
+
+def test_keys_accept_pasted_json_and_reject_web_type(env):
+    c, cfg, db, app = env
+    g = db.add_group("g"); db.set_account(g, "youtube", "yt"); acc = db.accounts(g)[0]["id"]
+    web = json.dumps({"web": {"client_id": "1.apps.googleusercontent.com", "client_secret": "s"}})
+    r = c.put(f"/api/accounts/{acc}/keys", json={"client_id": web, "client_secret": ""})
+    assert r.status_code == 400 and "Desktop app" in r.json()["detail"]
+    ok = json.dumps({"installed": {"client_id": "2.apps.googleusercontent.com", "client_secret": "sec"}})
+    assert c.put(f"/api/accounts/{acc}/keys", json={"client_id": ok}).status_code == 200
+    assert db.account_credentials(acc) == {"client_id": "2.apps.googleusercontent.com", "client_secret": "sec"}
+    assert c.put(f"/api/accounts/{acc}/keys", json={"client_id": "{oops"}).status_code == 400

@@ -368,18 +368,22 @@ async function buildEditor(root) {
   if (!S.banners.length) { try { await loadBanners(); } catch (e) {} }
   try { S.presets = await api("GET", "/api/presets"); } catch (e) { S.presets = S.presets || []; }
   const cfg = S.cfg;
-  let bannerSel = c.banner ? {...c.banner} : null;
+  let cards = [];
   const title = h("input", {type: "text", maxlength: 200, value: c.title});
   const desc = h("textarea", {}); desc.value = c.description;
   const tags = h("input", {type: "text", placeholder: "#тег1 #тег2"}); tags.value = c.tags;
   const when = h("input", {type: "datetime-local", value: isoToInput(c.publish_at)});
-  const pvTitle = h("div", {class: "note", id: "bn-info"}, "");
   const bnBox = h("div", {});
   const video = h("video", {controls: true, playsinline: true, preload: "auto", poster: `/api/clips/${c.id}/thumb`, src: `/api/clips/${c.id}/video?t=${S.previewTick || 0}`});
   video.addEventListener("loadedmetadata", () => { if (video.currentTime === 0) video.currentTime = 0.1; });
   video.addEventListener("error", () => toast("Браузер не смог загрузить видео клипа (превью-кадр при этом виден).", "err"));
   const frame = h("div", {class: "frame"}, video);
   const ov = h("div", {class: "bn-ov"}); frame.append(ov);
+  if (!document.getElementById("nz-key-svg")) {   // фильтр «зелёный → прозрачный» для живого предпросмотра (точный результат — в рендере)
+    const wrap = document.createElement("div"); wrap.id = "nz-key-svg"; wrap.style.cssText = "position:absolute;width:0;height:0;overflow:hidden";
+    wrap.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" width="0" height="0"><filter id="nz-key" color-interpolation-filters="sRGB"><feColorMatrix type="matrix" values="1 0 0 0 0  0 1 0 0 0  0 0 1 0 0  3 -6 3 0 1"/></filter></svg>';
+    document.body.append(wrap);
+  }
   let live = true;   // живой предпросмотр: баннер рисуется поверх плеера (приблизительно); «точный» — настоящий рендер ffmpeg
   const pvBtn = h("button", {class: "btn", onclick: preview}, "Точный предпросмотр (рендер)");
   async function preview() {
@@ -388,7 +392,7 @@ async function buildEditor(root) {
     }
     try {
       await save(true);
-      if (!bannerSel) return toast("Баннер не выбран", "err");
+      if (!specsNow().length) return toast("Баннер не выбран", "err");
       pvBtn.disabled = true; pvBtn.textContent = "Собираю предпросмотр…";
       const t = await api("POST", `/api/clips/${c.id}/preview`); startTracking(t);
       for (;;) {
@@ -405,9 +409,10 @@ async function buildEditor(root) {
     pvBtn.disabled = false; pvBtn.textContent = "Точный предпросмотр (рендер)";
   }
 
-  /* ---- живой предпросмотр баннера поверх плеера ---- */
-  const GW = 1080, GH = 1920;
-  let ovEl = null, ovName = "", frozen = null, frozenDone = false, lastBn = 0;
+  /* ---- баннеры клипа: каждый — отдельная карточка со своими настройками; живой предпросмотр поверх плеера ---- */
+  const GW = 1080, GH = 1920, MAXB = cfg.max_banners || 5;
+  function newCard(sel, choosing = false) { return {sel, F: {}, ovEl: null, ovName: "", frozen: null, frozenDone: false, info: h("div", {class: "note"}), infoT: 0, choosing}; }
+  cards = (c.banners || []).map(sp => newCard({...sp}));
   // громкость плеера принадлежит пользователю; мы трогаем её только на время приглушения звука под баннер
   let userVol = video.volume, ducked = 0, lastSet = -1;
   function setVol(v) { lastSet = v; video.volume = Math.min(1, Math.max(0, v)); }
@@ -419,9 +424,15 @@ async function buildEditor(root) {
     if (level >= 1) { if (ducked) { ducked = 0; setVol(userVol); } return; }
     if (ducked !== level) { ducked = level; setVol(userVol * level); }
   }
-  function hideOv() { if (ovEl) { ovEl.style.display = "none"; if (ovEl.pause) ovEl.pause(); } duck(1); }
+  function hideCard(card) { if (card.ovEl) { card.ovEl.style.display = "none"; if (card.ovEl.pause) card.ovEl.pause(); } }
+  function hideOv() { cards.forEach(hideCard); duck(1); }
+  // видимая часть видео-баннера: при хромакее с тем же ключевым цветом, что нашёл сервер, пустой фон по краям обрезается
+  function visBox(s, b) {
+    return b.kind === "video" && s.chroma && b.box && b.key && String(s.chroma_color).toLowerCase() === b.key.toLowerCase() ? b.box : null;
+  }
   function bannerGeom(s, b) {
-    const aspect = b.width / b.height;
+    const bx = visBox(s, b);
+    const aspect = bx ? (b.width * (bx[2] - bx[0])) / (b.height * (bx[3] - bx[1])) : b.width / b.height;
     let w = GW * s.width_percent / 100;
     if (b.kind === "video") w = Math.max(w, Math.sqrt((cfg.min_area_percent / 100) * GW * GH * aspect));
     w = Math.min(w, GW, GH * aspect);
@@ -430,78 +441,97 @@ async function buildEditor(root) {
   function bannerDur(s, b) {
     return b.kind === "video" ? (s.duration > 0 ? Math.min(s.duration, b.duration) : b.duration) : (s.duration > 0 ? s.duration : cfg.banner_defaults.image.duration || 6);
   }
-  function ensureOv(b) {
-    if (ovEl && ovName === b.name) return;
-    ov.replaceChildren(); ovName = b.name; frozen = null;
+  const startOf = s => s.start_mode === "percent" ? c.duration * Math.min(Math.max(s.start_percent || 0, 0), 100) / 100 : s.start;
+  function ensureOv(card, b) {
+    if (card.ovEl && card.ovName === b.name) return;
+    if (card.ovEl) card.ovEl.remove();
+    card.ovName = b.name; card.frozen = null;
     const src = "/api/banners/file?name=" + encodeURIComponent(b.name);
-    ovEl = b.kind === "video" ? h("video", {src, playsinline: true, preload: "auto"}) : h("img", {src, alt: ""});
-    ovEl.style.cssText = "position:absolute;display:none;height:auto";
-    ov.append(ovEl);
+    card.ovEl = b.kind === "video" ? h("video", {src, playsinline: true, preload: "auto"}) : h("img", {src, alt: ""});
+    card.ovEl.style.cssText = "position:absolute;display:none;height:auto";
+    ov.append(card.ovEl);
   }
-  video.addEventListener("seeked", () => { frozen = null; frozenDone = !!(bannerSel && F.start && video.currentTime > +F.start.value + 0.3); });
-  video.addEventListener("play", () => { if (frozen) { frozen = null; frozenDone = true; } });
+  video.addEventListener("seeked", () => cards.forEach(k => { k.frozen = null; k.frozenDone = !!(k.sel && video.currentTime > startOf(specOf(k)) + 0.3); }));
+  video.addEventListener("play", () => cards.forEach(k => { if (k.frozen) { k.frozen = null; k.frozenDone = true; } }));
+  function tickCard(card) {
+    const b = card.sel && !card.choosing && S.banners.find(x => x.name === card.sel.name);
+    if (!live || !b) { hideCard(card); return 1; }
+    ensureOv(card, b);
+    const s = specOf(card), dur = bannerDur(s, b), t0 = startOf(s), t = video.currentTime;
+    const now = performance.now();
+    let show = false, bt = 0, level = 1;
+    if (s.pause) {
+      if (!card.frozen && !video.paused && !card.frozenDone && t >= t0 && t < t0 + 0.6) { card.frozen = {at: now}; video.pause(); }
+      if (card.frozen) {
+        bt = (now - card.frozen.at) / 1000; show = true;
+        if (bt >= dur) { card.frozen = null; card.frozenDone = true; show = false; video.play().catch(() => {}); }
+      } else if (video.paused && t >= t0 && t < t0 + 0.05) { show = true; bt = 0; }
+    } else {
+      bt = t - t0; show = t >= t0 && t < t0 + Math.min(dur, c.duration - t0);
+      if (show && b.has_audio) level = Math.max(s.duck_percent / 100, 0.001);
+    }
+    if (!show) { hideCard(card); return 1; }
+    const g = bannerGeom(s, b);
+    const y = s.position === "top" ? s.margin : s.position === "bottom" ? GH - g.h - s.margin : (GH - g.h) / 2;
+    const e = card.ovEl;
+    e.style.display = "block";
+    e.style.left = ((GW - g.w) / 2 / GW * 100) + "%"; e.style.width = (g.w / GW * 100) + "%"; e.style.top = (y / GH * 100) + "%";
+    if (b.kind === "video") {
+      const bx = visBox(s, b);
+      e.style.objectViewBox = bx ? `inset(${bx[1] * 100}% ${(1 - bx[2]) * 100}% ${(1 - bx[3]) * 100}% ${bx[0] * 100}%)` : "none";
+      e.style.filter = s.chroma ? "url(#nz-key)" : "none";   // приблизительное вырезание зелёного в живом предпросмотре
+    }
+    if (b.kind === "video") {
+      const playing = card.frozen || !video.paused;
+      if (e.volume !== userVol) e.volume = userVol;
+      e.muted = video.muted;
+      if (Math.abs(e.currentTime - bt) > 0.35) e.currentTime = Math.max(0, bt);
+      if (playing && e.paused) e.play().catch(() => {});
+      if (!playing && !e.paused) e.pause();
+    }
+    return level;
+  }
   function tick() {
     if (!document.contains(video)) return;   // редактор перерисован — цикл останавливается
     requestAnimationFrame(tick);
-    const b = bannerSel && S.banners.find(x => x.name === bannerSel.name);
-    if (!live || !b || !F.start || !F.start.isConnected) { hideOv(); return; }
-    ensureOv(b);
-    const s = bannerSpecFrom(), dur = bannerDur(s, b), t0 = s.start, t = video.currentTime;
-    const now = performance.now();
-    let show = false, bt = 0;
-    if (s.pause) {
-      if (!frozen && !video.paused && !frozenDone && t >= t0 && t < t0 + 0.6) { frozen = {at: now, auto: true}; video.pause(); }
-      if (frozen) {
-        bt = (now - frozen.at) / 1000; show = true;
-        if (bt >= dur) { frozen = null; frozenDone = true; show = false; video.play().catch(() => {}); }
-      } else if (video.paused && t >= t0 && t < t0 + 0.05) { show = true; bt = 0; }
-      duck(1);
-    } else {
-      bt = t - t0; show = t >= t0 && t < t0 + Math.min(dur, c.duration - t0);
-      duck(show && b.has_audio ? Math.max(s.duck_percent / 100, 0.001) : 1);
-    }
-    if (!show) { hideOv(); return; }
-    const g = bannerGeom(s, b), Hh = GH;
-    const y = s.position === "top" ? s.margin : s.position === "bottom" ? Hh - g.h - s.margin : (Hh - g.h) / 2;
-    ovEl.style.display = "block";
-    ovEl.style.left = ((GW - g.w) / 2 / GW * 100) + "%"; ovEl.style.width = (g.w / GW * 100) + "%"; ovEl.style.top = (y / Hh * 100) + "%";
-    if (b.kind === "video") {
-      const playing = frozen || !video.paused;
-      if (ovEl.volume !== userVol) ovEl.volume = userVol;
-      ovEl.muted = video.muted;
-      if (Math.abs(ovEl.currentTime - bt) > 0.35) ovEl.currentTime = Math.max(0, bt);
-      if (playing && ovEl.paused) ovEl.play().catch(() => {});
-      if (!playing && !ovEl.paused) ovEl.pause();
-    }
+    let level = 1;
+    for (const card of cards) level = Math.min(level, tickCard(card));
+    duck(level);
   }
   requestAnimationFrame(tick);
-  function bannerSpecFrom() {
-    return {name: bannerSel.name, start: +F.start.value, duration: +F.duration.value, width_percent: +F.width.value,
-      position: F.pos.value, margin: +F.margin.value, duck_percent: +F.duck.value, pause: !!(F.pause && F.pause.checked)};
+  // параметры карточки: из полей формы, а пока форма не построена — как сохранены
+  function specOf(card) {
+    const F = card.F, s = card.sel;
+    if (!F.start || !F.start.isConnected) return {...s};
+    return {name: s.name, start: +F.start.value || 0, start_mode: F.mode.value, start_percent: +F.pct.value || 0, duration: +F.duration.value,
+      width_percent: +F.width.value, position: F.pos.value, margin: +F.margin.value, duck_percent: +F.duck.value, pause: !!F.pause.checked,
+      ...(F.chroma ? {chroma: !!F.chroma.checked, chroma_color: F.chromaColor.value} : {})};
   }
-  const F = {};
+  const specsNow = () => cards.filter(k => k.sel && !k.choosing).map(specOf);
+  const syncCards = () => cards.forEach(k => { if (k.sel && !k.choosing) k.sel = specOf(k); });
   function bannerPresetRow() {
-    const list = S.presets.filter(p => p.banner);
-    const sel = h("select", {style: {flex: "1", minWidth: "160px"}}, [h("option", {value: ""}, list.length ? "— пресет баннера —" : "— пресетов баннера пока нет —"),
-      ...list.map(p => h("option", {value: p.id}, p.name))]);
+    const list = S.presets.filter(p => (p.banners || []).length);
+    const sel = h("select", {style: {flex: "1", minWidth: "160px"}}, [h("option", {value: ""}, list.length ? "— пресет баннеров —" : "— пресетов баннера пока нет —"),
+      ...list.map(p => h("option", {value: p.id}, p.name + (p.banners.length > 1 ? ` (${p.banners.length} баннера)` : "")))]);
     if (S.bpresetId && list.some(p => p.id === S.bpresetId)) sel.value = S.bpresetId;
     sel.onchange = () => {
       S.bpresetId = Number(sel.value) || null;
       const p = list.find(x => x.id === S.bpresetId); if (!p) return;
-      if (!S.banners.some(b => b.name === p.banner.name)) return toast(`Файла баннера «${p.banner.name}» из пресета больше нет — загрузи его заново`, "err");
-      bannerSel = {...p.banner}; drawBanner(); toast(`Пресет «${p.name}» применён к баннеру (не забудь «Сохранить»)`);
+      const gone = p.banners.find(sp => !S.banners.some(b => b.name === sp.name));
+      if (gone) return toast(`Файла баннера «${gone.name}» из пресета больше нет — загрузи его заново`, "err");
+      cards = p.banners.map(sp => newCard({...sp})); drawBanner(); toast(`Пресет «${p.name}» применён к баннерам (не забудь «Сохранить»)`);
     };
     return h("div", {class: "row", style: {marginBottom: "12px"}}, sel,
-      h("button", {class: "btn sm", disabled: !bannerSel, onclick: () => {
+      h("button", {class: "btn sm", disabled: !specsNow().length, onclick: () => {
         const name = h("input", {type: "text", placeholder: "Например: «Реклама казино — внизу»"});
         const cur = list.find(x => x.id === S.bpresetId); if (cur) name.value = cur.name;
-        dialog(h("div", {}, h("h3", {}, "Сохранить пресет баннера"),
-          h("div", {class: "muted small", style: {marginBottom: "10px"}}, "Сохранятся все поля баннера: файл, начало, длительность, ширина, положение, отступ, громкость, пауза. Пресет с тем же названием будет перезаписан."), name),
+        dialog(h("div", {}, h("h3", {}, "Сохранить пресет баннеров"),
+          h("div", {class: "muted small", style: {marginBottom: "10px"}}, "Сохранятся все баннеры клипа и все их поля: файл, начало (секунды или %), длительность, ширина, положение, отступ, громкость, пауза. Пресет с тем же названием будет перезаписан."), name),
           [{text: "Отмена", cls: "ghost"}, {text: "Сохранить", cls: "primary", fn: async () => {
             try {
               const old = S.presets.find(x => x.name === name.value.trim());
-              const r = await api("POST", "/api/presets", {name: name.value, banner: bannerSpecFrom(), tags: old ? old.tags : "", footer: old ? old.footer : ""});
-              S.bpresetId = r.id; await save(true); toast("Пресет баннера сохранён"); render();
+              const r = await api("POST", "/api/presets", {name: name.value, banners: specsNow(), tags: old ? old.tags : "", footer: old ? old.footer : ""});
+              S.bpresetId = r.id; await save(true); toast("Пресет баннеров сохранён"); render();
             } catch (e) { fail(e); } }}]);
         setTimeout(() => name.focus(), 50); }}, "Сохранить как пресет"),
       h("button", {class: "btn sm danger", disabled: !S.bpresetId || !list.some(p => p.id === S.bpresetId), onclick: () => {
@@ -509,63 +539,107 @@ async function buildEditor(root) {
         confirmBox("Удалить пресет?", `«${p.name}» будет удалён (баннеры клипов, к которым он применён, не изменятся).`, "Удалить", async () => {
           try { await api("DELETE", `/api/presets/${p.id}`); S.bpresetId = null; await save(true); render(); } catch (e) { fail(e); } }); }}, "Удалить пресет"));
   }
-  function drawBanner() {
-    bnBox.replaceChildren(bannerPresetRow());
-    const lib = h("div", {class: "lib"}, S.banners.map(b => h("div", {class: "bn" + (bannerSel && bannerSel.name === b.name ? " on" : ""), title: b.name, onclick: () => pick(b)},
+  function libFor(card) {
+    return h("div", {class: "lib"}, S.banners.map(b => h("div", {class: "bn" + (card.sel && card.sel.name === b.name ? " on" : ""), title: b.name, onclick: () => pick(card, b)},
       h("div", {class: "pv"}, b.kind === "image" ? h("img", {src: "/api/banners/file?name=" + encodeURIComponent(b.name), alt: ""}) : "▶"),
       h("span", {}, b.name), h("span", {}, b.kind === "video" ? `${b.duration} с${b.has_audio ? " ♪" : ""}` : "картинка"))),
-      h("label", {class: "bn add"}, "+ файл", h("input", {type: "file", hidden: true, accept: "image/*,video/*", onchange: upload})),
-      bannerSel ? h("div", {class: "bn add", style: {color: "var(--danger)"}, onclick: () => { bannerSel = null; drawBanner(); }}, "без баннера") : null);
-    bnBox.append(lib);
-    if (!bannerSel) { bnBox.append(h("div", {class: "note"}, "Баннер для этого клипа не выбран.")); return; }
-    const b = S.banners.find(x => x.name === bannerSel.name);
+      h("label", {class: "bn add"}, "+ файл", h("input", {type: "file", hidden: true, accept: "image/*,video/*", onchange: e => upload(e, card)})));
+  }
+  function cardEl(card, idx) {
+    const head = (extra) => h("div", {class: "row", style: {justifyContent: "space-between", marginBottom: "10px"}},
+      h("b", {}, `Баннер ${idx + 1}`, card.sel ? h("span", {class: "muted small", style: {marginLeft: "8px", fontWeight: "400"}}, card.sel.name) : null),
+      h("div", {class: "row", style: {gap: "6px"}}, extra,
+        h("button", {class: "btn sm danger", onclick: () => { syncCards(); cards.splice(idx, 1); hideOv(); drawBanner(); }}, "Убрать")));
+    const box = h("div", {class: "bncard"});
+    if (!card.sel || card.choosing) {
+      box.append(head(card.sel ? h("button", {class: "btn sm", onclick: () => { card.choosing = false; drawBanner(); }}, "Отмена") : null),
+        h("div", {class: "muted small", style: {marginBottom: "8px"}}, "Выбери файл баннера:"), libFor(card));
+      return box;
+    }
+    const b = S.banners.find(x => x.name === card.sel.name), s = card.sel, F = card.F;
     const isVideo = b && b.kind === "video";
+    const info = () => cardInfo(card);
     const mk = (id, label, val, min, max, step, hint) => { F[id] = h("input", {type: "number", min, max, step, value: val, oninput: info}); return h("div", {class: "field"}, h("label", {}, label), F[id], hint ? h("div", {class: "hint"}, hint) : null); };
     F.pos = h("select", {onchange: info}, [["center", "По центру"], ["top", "Сверху"], ["bottom", "Снизу"]].map(([v, t]) => h("option", {value: v}, t)));
-    F.pos.value = bannerSel.position || "center";
-    F.pause = h("input", {type: "checkbox", onchange: info}); F.pause.checked = !!bannerSel.pause;
-    bnBox.append(h("div", {class: "grid3"},
-      mk("start", "Начало, с", bannerSel.start ?? 3, 0, 3600, 0.5),
-      isVideo
-        ? mk("duration", "Длительность, с", Math.round(((bannerSel.duration > 0 ? Math.min(bannerSel.duration, b.duration) : b.duration)) * 10) / 10, 0.5, b.duration, 0.1, `длина видео-баннера: ${b.duration} с (можно показать только начало)`)
-        : mk("duration", "Длительность, с", bannerSel.duration || 6, 0.5, 600, 0.5, "сколько показывать"),
-      mk("width", "Ширина, % экрана", bannerSel.width_percent ?? 90, 10, 100, 1)),
-      h("div", {class: "grid3"}, h("div", {class: "field"}, h("label", {}, "Положение"), F.pos),
-        mk("margin", "Отступ, px", bannerSel.margin ?? 160, 0, 800, 10, "для «сверху/снизу»"),
-        mk("duck", "Громкость игры, %", bannerSel.duck_percent ?? 15, 0, 100, 1, isVideo && b.has_audio ? "звук основного видео на время баннера" : "актуально для баннера со звуком")),
+    F.pos.value = s.position || "center";
+    F.pause = h("input", {type: "checkbox", onchange: info}); F.pause.checked = !!s.pause;
+    if (isVideo) {
+      F.chroma = h("input", {type: "checkbox", onchange: () => { drawKeyHint(); info(); }}); F.chroma.checked = !!s.chroma;
+      F.chromaColor = h("input", {type: "color", value: s.chroma_color || b.key || "#00ff00", style: {width: "40px", height: "28px", padding: "0", border: "none", background: "none"}, onchange: info});
+    }
+    // начало: в секундах от начала клипа или в процентах длины клипа
+    F.mode = h("select", {onchange: () => { showMode(); info(); }}, [["seconds", "В секундах"], ["percent", "В % видео"]].map(([v, t]) => h("option", {value: v}, t)));
+    F.mode.value = s.start_mode === "percent" ? "percent" : "seconds";
+    const startField = mk("start", "Начало, с", s.start ?? 3, 0, 3600, 0.5);
+    const pctField = mk("pct", "Начало, % видео", s.start_percent ?? 10, 0, 99, 1, `клип ${Math.round(c.duration)} с: 10% ≈ ${(c.duration * 0.1).toFixed(1)} с`);
+    const drawKeyHint = () => { if (F.chromaColor) F.chromaColor.disabled = !F.chroma.checked; };
+    setTimeout(drawKeyHint, 0);
+    const showMode = () => { startField.style.display = F.mode.value === "seconds" ? "" : "none"; pctField.style.display = F.mode.value === "percent" ? "" : "none"; };
+    showMode();
+    box.append(head(h("button", {class: "btn sm", onclick: () => { syncCards(); card.choosing = true; drawBanner(); }}, "Сменить файл")),
+      h("div", {class: "grid3"},
+        h("div", {class: "field"}, h("label", {}, "Начало"), F.mode), startField, pctField),
+      h("div", {class: "grid3"},
+        isVideo
+          ? mk("duration", "Длительность, с", Math.round(((s.duration > 0 ? Math.min(s.duration, b.duration) : b.duration)) * 10) / 10, 0.5, b.duration, 0.1, `длина видео-баннера: ${b.duration} с (можно показать только начало)`)
+          : mk("duration", "Длительность, с", s.duration || 6, 0.5, 600, 0.5, "сколько показывать"),
+        mk("width", "Ширина, % экрана", s.width_percent ?? 90, 10, 100, 1),
+        h("div", {class: "field"}, h("label", {}, "Положение"), F.pos)),
+      h("div", {class: "grid3"},
+        mk("margin", "Отступ, px", s.margin ?? 160, 0, 800, 10, "для «сверху/снизу»"),
+        mk("duck", "Громкость игры, %", s.duck_percent ?? 15, 0, 100, 1, isVideo && b.has_audio ? "звук основного видео на время баннера" : "актуально для баннера со звуком")),
       h("label", {class: "check", style: {margin: "0 0 12px"}}, F.pause, h("span", {}, "Поставить основное видео на паузу, пока играет баннер (клип станет длиннее на время баннера)")),
-      pvTitle);
-    info();
+      isVideo ? h("div", {class: "row", style: {margin: "0 0 12px", gap: "8px", alignItems: "center"}},
+        h("label", {class: "check", style: {margin: "0"}}, F.chroma, h("span", {}, "Убрать однотонный фон (хромакей)")), F.chromaColor,
+        h("span", {class: "muted small"}, b.key ? "цвет фона найден автоматически" : "фон не найден — выбери цвет вручную")) : null,
+      card.info);
+    setTimeout(info, 0);
+    return box;
   }
-  let infoT;
-  function info() {
-    clearTimeout(infoT);
-    infoT = setTimeout(async () => {
-      if (!bannerSel || !F.start || !document.contains(pvTitle)) return;
-      const s = bannerSpecFrom();
+  function drawBanner() {
+    syncCards();
+    bnBox.replaceChildren(bannerPresetRow());
+    if (!cards.length) {
+      cards.push(newCard(null, true));
+    }
+    cards.forEach((k, i) => bnBox.append(cardEl(k, i)));
+    const ready = cards.every(k => k.sel && !k.choosing);
+    if (ready && cards.length < MAXB) bnBox.append(h("button", {class: "btn", style: {marginTop: "4px"}, onclick: () => { cards.push(newCard(null, true)); drawBanner(); }}, "+ Добавить ещё один баннер"));
+    else if (ready) bnBox.append(h("div", {class: "muted small"}, `Достигнут лимит: ${MAXB} баннеров на клип.`));
+    if (cards.length === 1 && !cards[0].sel) bnBox.append(h("div", {class: "note"}, "Баннер для этого клипа не выбран — клип выйдет без рекламы."));
+  }
+  function cardInfo(card) {
+    clearTimeout(card.infoT);
+    card.infoT = setTimeout(async () => {
+      if (!card.sel || !card.F.start || !card.F.start.isConnected) return;
+      const s = specOf(card);
       try {
         const q = new URLSearchParams({name: s.name, start: s.start, duration: s.duration, width_percent: s.width_percent, position: s.position, duck_percent: s.duck_percent, margin: s.margin});
+        if (s.chroma !== undefined) { q.set("chroma", s.chroma ? "true" : "false"); q.set("chroma_color", s.chroma_color || ""); }
         const d = await api("GET", "/api/banners/describe?" + q);
-        pvTitle.className = "note " + (d.ok ? "ok" : "warn"); pvTitle.textContent = d.text;
-      } catch (e) { pvTitle.className = "note warn"; pvTitle.textContent = e.message; }
+        card.info.className = "note " + (d.ok ? "ok" : "warn"); card.info.textContent = d.text;
+      } catch (e) { card.info.className = "note warn"; card.info.textContent = e.message; }
     }, 250);
   }
-  function pick(b) {
+  function pick(card, b) {
     const d = (cfg.banner_defaults || {})[b.kind] || {};
-    bannerSel = {name: b.name, ...d, position: "center", ...(bannerSel && bannerSel.name === b.name ? bannerSel : {})};   // новый баннер — по центру
+    const same = card.sel && card.sel.name === b.name;
+    const ck = b.kind === "video" ? {chroma: !!b.key, chroma_color: b.key || "#00ff00"} : {};
+    card.sel = {name: b.name, ...d, ...ck, position: "center", ...(same ? card.sel : {})};   // новый баннер — по центру
+    card.choosing = false; card.ovName = "";
     drawBanner();
   }
-  async function upload(e) {
+  async function upload(e, card) {
     const f = e.target.files[0]; if (!f) return;
     toast("Загружаю баннер…");
     try {
       const r = await api("PUT", "/api/banners?name=" + encodeURIComponent(f.name), undefined, f);
-      await loadBanners(); pick(S.banners.find(x => x.name === r.name) || r);
+      await loadBanners(); pick(card, S.banners.find(x => x.name === r.name) || r);
     } catch (er) { fail(er); }
   }
   async function save(silent) {
     const body = {title: title.value, description: desc.value, tags: tags.value, publish_at: inputToIso(when.value)};
-    body.banner = bannerSel ? bannerSpecFrom() : null;
+    body.banners = specsNow();
     const r = await api("PATCH", `/api/clips/${c.id}`, body);
     Object.assign(c, r); const i = S.clips.findIndex(x => x.id === c.id); if (i >= 0) S.clips[i] = r;
     tags.value = r.tags;
@@ -580,7 +654,7 @@ async function buildEditor(root) {
     const p = S.presets.find(x => x.id === Number(presetSel.value));
     presetInfo.style.display = p ? "" : "none";
     if (!p) return;
-    presetInfo.textContent = [p.banner ? `баннер: ${p.banner.name}` : "", p.tags ? `теги: ${p.tags}` : "", p.footer ? `в конце описания: «${p.footer}»` : ""].filter(Boolean).join(" · ");
+    presetInfo.textContent = [(p.banners || []).length ? `баннеры: ${p.banners.map(x => x.name).join(", ")}` : "", p.tags ? `теги: ${p.tags}` : "", p.footer ? `в конце описания: «${p.footer}»` : ""].filter(Boolean).join(" · ");
   }
   async function applyPreset(ids, text) {
     const p = S.presets.find(x => x.id === Number(presetSel.value)); if (!p) return toast("Сначала выбери пресет", "err");
@@ -592,17 +666,17 @@ async function buildEditor(root) {
   }
   function savePresetDialog() {
     const name = h("input", {type: "text", placeholder: "Например: «Реклама казино»"});
-    const useBn = h("input", {type: "checkbox"}); useBn.checked = !!bannerSel; useBn.disabled = !bannerSel;
+    const useBn = h("input", {type: "checkbox"}); useBn.checked = specsNow().length > 0; useBn.disabled = !specsNow().length;
     const ptags = h("input", {type: "text", placeholder: "#теги, которые добавятся ко всем"}); ptags.value = "";
     const foot = h("textarea", {placeholder: "Текст, который допишется в конец описания (ссылка, промокод…)", style: {minHeight: "70px"}});
     dialog(h("div", {}, h("h3", {}, "Сохранить пресет"),
       h("div", {class: "field"}, h("label", {}, "Название"), name),
-      h("label", {class: "check"}, useBn, h("span", {}, bannerSel ? `Баннер ${bannerSel.name} с текущими настройками` : "Баннер (сейчас не выбран)")),
+      h("label", {class: "check"}, useBn, h("span", {}, specsNow().length ? `Баннеры клипа (${specsNow().map(x => x.name).join(", ")}) с текущими настройками` : "Баннер (сейчас не выбран)")),
       h("div", {class: "field", style: {marginTop: "12px"}}, h("label", {}, "Теги"), ptags),
       h("div", {class: "field"}, h("label", {}, "Текст в конце описания"), foot)),
       [{text: "Отмена", cls: "ghost"}, {text: "Сохранить", cls: "primary", fn: async () => {
         try {
-          const body = {name: name.value, tags: ptags.value, footer: foot.value, banner: useBn.checked && bannerSel ? bannerSpecFrom() : null};
+          const body = {name: name.value, tags: ptags.value, footer: foot.value, banners: useBn.checked ? specsNow() : []};
           const r = await api("POST", "/api/presets", body); S.presetId = r.id; await save(true); toast("Пресет сохранён"); render();
         } catch (e) { fail(e); } }}]);
     setTimeout(() => name.focus(), 50);
@@ -688,6 +762,7 @@ function pageAccounts(page) {
         h("div", {class: "grow"}, h("b", {}, a.label), h("span", {class: "muted small"}, (PLAT[a.platform] || ["", a.platform])[1])),
         !a.supported ? h("span", {class: "badge"}, "публикация позже")
           : a.authorized ? h("span", {class: "badge ok"}, "вход выполнен") : h("span", {class: "badge warn"}, "нужен вход"),
+        a.platform === "youtube" ? h("button", {class: "btn sm", title: a.has_keys ? "Свои ключи заданы: " + a.keys_id + "…" : "Использовать общие ключи (client_secret.json или .env)", onclick: () => keysDialog(a)}, a.has_keys ? "Ключи ✓" : "Ключи") : null,
         !a.supported ? null : S.tasks.some(t => t.kind === "login" && t.status === "running")
           ? h("button", {class: "btn sm danger", onclick: cancelLogin}, "Отменить вход")
           : h("button", {class: "btn sm" + (a.authorized ? "" : " primary"), onclick: () => login(a)}, a.authorized ? "Войти заново" : "Войти"),
@@ -705,6 +780,19 @@ function pageAccounts(page) {
     }
   }
   page.append(h("div", {class: "two"}, left, right));
+}
+function keysDialog(a) {
+  const id = h("input", {type: "text", placeholder: "123456789-abc….apps.googleusercontent.com", autocomplete: "off", spellcheck: "false"});
+  const sec = h("input", {type: "password", placeholder: a.has_keys ? "уже задан — впиши новый, чтобы заменить" : "GOCSPX-…", autocomplete: "off"});
+  dialog(h("div", {}, h("h3", {}, `Ключи Google для «${a.label}»`),
+      h("div", {class: "muted small", style: {marginBottom: "10px"}}, "Client ID и Client secret OAuth-приложения из Google Cloud (Credentials → OAuth client ID, тип строго «Desktop app», не «Web application»). Можно вставить в первое поле содержимое скачанного JSON целиком. У каждого канала могут быть свои — тогда у каждого свой дневной лимит загрузок. Пусто = общие ключи."),
+      h("label", {class: "muted small"}, "Client ID"), id, h("div", {style: {height: "8px"}}),
+      h("label", {class: "muted small"}, "Client secret"), sec),
+    [{text: "Отмена", cls: "ghost"}, ...(a.has_keys ? [{text: "Сбросить", cls: "ghost", fn: async () => { try { await api("PUT", `/api/accounts/${a.id}/keys`, {}); toast("Свои ключи убраны"); await loadGroups(); render(); } catch (e) { fail(e); } }}] : []),
+      {text: "Сохранить", cls: "primary", fn: async () => {
+        if (a.has_keys && !id.value.trim() && !sec.value.trim()) return;
+        try { await api("PUT", `/api/accounts/${a.id}/keys`, {client_id: id.value, client_secret: sec.value}); toast("Ключи сохранены — нажми «Войти»"); await loadGroups(); render(); } catch (e) { fail(e); } }}]);
+  setTimeout(() => id.focus(), 50);
 }
 async function login(a) {
   try { const t = await api("POST", `/api/accounts/${a.id}/login`); startTracking(t); toast("Открою браузер для входа — выбери аккаунт и канал"); render(); }

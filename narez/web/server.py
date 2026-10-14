@@ -54,6 +54,11 @@ class AccountIn(BaseModel):
     label: str = ""
 
 
+class KeysIn(BaseModel):
+    client_id: str = ""
+    client_secret: str = ""
+
+
 class CutIn(BaseModel):
     mode: str = "moments"        # moments = интересные моменты, full = всё видео по частям
     length: float = 45.0         # длина части (режим full), секунды
@@ -92,6 +97,7 @@ class ProxyUseIn(BaseModel):
 class PresetIn(BaseModel):
     name: str
     banner: Optional[dict] = None
+    banners: Optional[list[dict]] = None
     tags: str = ""
     footer: str = ""
 
@@ -118,6 +124,7 @@ class ClipPatch(BaseModel):
     description: Optional[str] = None
     tags: Optional[str] = None
     banner: Optional[dict] = None
+    banners: Optional[list[dict]] = None
     publish_at: Optional[str] = None
     group_id: Optional[int] = None
 
@@ -172,17 +179,31 @@ def create_app(cfg: dict | None = None) -> FastAPI:
             files[dflt.name] = dflt
         return files
 
-    def banner_json(spec_json: str):
-        if not spec_json:
-            return None
-        spec = json.loads(spec_json)
-        return {**spec, "name": Path(spec["path"]).name}
+    def banners_json(spec_json: str) -> list[dict]:
+        return [{**sp, "name": Path(sp["path"]).name} for sp in bn.specs_from_json(spec_json)]
+
+    def max_banners() -> int:
+        return max(1, int(cfg["banner"].get("max_banners", 5)))
+
+    def clean_specs(raw: list[dict] | None) -> list[dict]:
+        """Баннеры из интерфейса -> проверенные параметры с путями к файлам библиотеки (жёсткий лимит max_banners на клип)."""
+        raw = [r for r in (raw or []) if r]
+        if len(raw) > max_banners():
+            raise HTTPException(400, f"На один клип можно наложить не больше {max_banners()} баннеров (настройка [banner] max_banners)")
+        lib, out = library(), []
+        for r in raw:
+            name = str(r.get("name", ""))
+            if name not in lib:
+                raise HTTPException(400, "Баннер не найден в библиотеке — загрузи файл заново")
+            out.append(bn.normalize_spec({**r, "path": str(lib[name])}, cfg))
+        return out
 
     def clip_json(c, d: DB) -> dict:
         job = d.job(c["job_id"])
         return {"id": c["id"], "job_id": c["job_id"], "title": c["title"] or "", "description": c["reason"] or "",
                 "tags": c["tags"] or "", "duration": round((c["end"] or 0) - (c["start"] or 0), 1),
-                "banner": banner_json(c["banner"]), "publish_at": c["publish_at"] or "",
+                "banners": banners_json(c["banner"]),
+                "banner": (banners_json(c["banner"]) or [None])[0], "publish_at": c["publish_at"] or "",
                 "has_file": bool(c["path"]) and Path(c["path"]).exists(),
                 "has_thumb": (bool(c["thumb"]) and Path(c["thumb"]).exists()) or (bool(c["path"]) and Path(c["path"]).exists()),
                 "source": job["title"] if job else "", "status": c["status"],
@@ -242,7 +263,7 @@ def create_app(cfg: dict | None = None) -> FastAPI:
     def config():
         return {"llm_model": cfg["llm"]["model"], "delay_minutes": cfg["youtube"].get("delay_minutes", 0),
                 "privacy": cfg["youtube"].get("privacy"), "min_clip": cfg["clips"]["min_seconds"],
-                "max_clip": cfg["clips"]["max_seconds"], "min_area_percent": cfg["banner"].get("min_area_percent", 25),
+                "max_clip": cfg["clips"]["max_seconds"], "max_banners": max_banners(), "min_area_percent": cfg["banner"].get("min_area_percent", 25),
                 "min_ahead_minutes": int(schedule.MIN_AHEAD.total_seconds() // 60), "platforms": PLATFORMS,
                 "real_platforms": sorted(REAL_PLATFORMS),
                 "banner_defaults": {"image": {k: v for k, v in bn.default_spec(cfg, "x.png").items() if k != "path"},
@@ -255,7 +276,9 @@ def create_app(cfg: dict | None = None) -> FastAPI:
         for g in d.groups():
             accs = [{"id": a["id"], "platform": a["platform"], "label": a["label"],
                      "supported": a["platform"] in REAL_PLATFORMS,
-                     "authorized": a["platform"] in REAL_PLATFORMS and token_path(cfg, a["platform"], a["id"]).exists()}
+                     "authorized": a["platform"] in REAL_PLATFORMS and token_path(cfg, a["platform"], a["id"]).exists(),
+                     "has_keys": bool(d.account_credentials(a["id"]).get("client_id")),
+                     "keys_id": (d.account_credentials(a["id"]).get("client_id") or "")[:14]}
                     for a in d.accounts(g["id"])]
             out.append({"id": g["id"], "name": g["name"], "accounts": accs, "pending": len(d.pending_clips(g["id"]))})
         return out
@@ -288,6 +311,36 @@ def create_app(cfg: dict | None = None) -> FastAPI:
                 pass
         return {"ok": True}
 
+    @app.put("/api/accounts/{account_id}/keys")
+    def account_keys(account_id: int, body: KeysIn, d: DB = Depends(get_db)):
+        """Свои Client ID и Client secret Google-приложения для аккаунта YouTube (пусто = использовать общие)."""
+        a = d.account(account_id)
+        if not a:
+            raise HTTPException(404, "Аккаунт не найден")
+        if a["platform"] != "youtube":
+            raise HTTPException(400, "Свои ключи пока поддерживаются только для YouTube")
+        cid, sec = body.client_id.strip(), body.client_secret.strip()
+        if cid.startswith("{"):  # вставили целиком содержимое client_secret.json
+            try:
+                j = json.loads(cid)
+            except ValueError:
+                raise HTTPException(400, "Не получилось прочитать JSON — вставь Client ID и Client secret в отдельные поля") from None
+            if "web" in j and "installed" not in j:
+                raise HTTPException(400, "Это ключи типа «Web application» — с ними вход не работает (redirect_uri_mismatch). "
+                                         "Создай в Google Cloud новый OAuth client ID типа «Desktop app»")
+            part = j.get("installed") or {}
+            cid, sec = str(part.get("client_id", "")).strip(), str(part.get("client_secret", "")).strip()
+        if bool(cid) != bool(sec):
+            raise HTTPException(400, "Нужно заполнить оба поля: Client ID и Client secret")
+        if cid and not cid.endswith(".apps.googleusercontent.com"):
+            raise HTTPException(400, "Client ID должен заканчиваться на .apps.googleusercontent.com — проверь, что скопировал именно его")
+        creds = d.account_credentials(account_id)
+        creds.pop("client_id", None); creds.pop("client_secret", None)
+        if cid:
+            creds.update(client_id=cid, client_secret=sec)
+        d.set_account_credentials(account_id, creds)
+        return {"ok": True, "has_keys": bool(cid)}
+
     @app.post("/api/accounts/{account_id}/login")
     def login(account_id: int, d: DB = Depends(get_db)):
         a = d.account(account_id)
@@ -306,12 +359,17 @@ def create_app(cfg: dict | None = None) -> FastAPI:
             port = pub.redirect_port()  # у Meta/TikTok адрес возврата зарегистрирован в приложении, порт фиксированный
         state = logins["current"] = {"account_id": account_id, "port": port, "cancelled": False}
         label = a["label"]
+        ck = d.account_credentials(account_id)
+        client = {"client_id": ck.get("client_id", ""), "client_secret": ck.get("client_secret", "")}
 
         def fn(log):
             log(f"Открываю браузер для входа в {title}… (Можно отменить кнопкой «Отменить вход».)")
+            if plat == "youtube":
+                log("Если Google пишет redirect_uri_mismatch — ключи созданы как «Web application»; нужен тип «Desktop app». "
+                    "access_denied — добавь почту в Test users этого проекта.")
             try:
                 if plat == "youtube":
-                    pub.authorize(account_id, port=port, timeout=300)
+                    pub.authorize(account_id, port=port, timeout=300, client=client)
                 else:
                     who = pub.authorize(account_id, timeout=300, label=label)
                     if who:
@@ -400,16 +458,9 @@ def create_app(cfg: dict | None = None) -> FastAPI:
             upd["reason"] = body.description.strip()
         if "tags" in sent and body.tags is not None:
             upd["tags"] = normalize_tags(body.tags)
-        if "banner" in sent:
-            if not body.banner:
-                upd["banner"] = ""
-            else:
-                lib = library()
-                name = str(body.banner.get("name", ""))
-                if name not in lib:
-                    raise HTTPException(400, "Баннер не найден в библиотеке — загрузи файл заново")
-                upd["banner"] = json.dumps(bn.normalize_spec({**body.banner, "path": str(lib[name])}, cfg),
-                                           ensure_ascii=False)
+        if "banners" in sent or "banner" in sent:
+            raw = body.banners if "banners" in sent else ([body.banner] if body.banner else [])
+            upd["banner"] = bn.specs_to_json(clean_specs(raw))
         if "group_id" in sent and body.group_id is not None:
             need_group(d, body.group_id)
             upd["group_id"] = body.group_id
@@ -460,7 +511,7 @@ def create_app(cfg: dict | None = None) -> FastAPI:
     @app.post("/api/clips/{clip_id}/preview")
     def clip_preview(clip_id: int, d: DB = Depends(get_db)):
         c = need_clip(d, clip_id)
-        if not c["banner"]:
+        if not bn.specs_from_json(c["banner"]):
             raise HTTPException(400, "У клипа нет баннера")
 
         def fn(log):
@@ -539,18 +590,12 @@ def create_app(cfg: dict | None = None) -> FastAPI:
     # ---------- пресеты ----------
     def preset_json(r) -> dict:
         data = json.loads(r["data"] or "{}")
-        return {"id": r["id"], "name": r["name"], "banner": data.get("banner"), "tags": data.get("tags", ""),
-                "footer": data.get("footer", "")}
+        banners = data.get("banners") or ([data["banner"]] if data.get("banner") else [])
+        return {"id": r["id"], "name": r["name"], "banner": banners[0] if banners else None, "banners": banners,
+                "tags": data.get("tags", ""), "footer": data.get("footer", "")}
 
-    def clean_banner(raw: dict | None):
-        if not raw:
-            return None
-        lib = library()
-        name = str(raw.get("name", ""))
-        if name not in lib:
-            raise HTTPException(400, "Баннер не найден в библиотеке — загрузи файл заново")
-        spec = bn.normalize_spec({**raw, "path": str(lib[name])}, cfg)
-        return {**{k: v for k, v in spec.items() if k != "path"}, "name": name}
+    def clean_banners(raw: list[dict] | None) -> list[dict]:
+        return [{**{k: v for k, v in sp.items() if k != "path"}, "name": Path(sp["path"]).name} for sp in clean_specs(raw)]
 
     @app.get("/api/presets")
     def presets(d: DB = Depends(get_db)):
@@ -561,8 +606,10 @@ def create_app(cfg: dict | None = None) -> FastAPI:
         name = body.name.strip()
         if not name:
             raise HTTPException(400, "Дай пресету название")
-        data = {"banner": clean_banner(body.banner), "tags": normalize_tags(body.tags), "footer": body.footer.strip()}
-        if not (data["banner"] or data["tags"] or data["footer"]):
+        banners = clean_banners(body.banners if body.banners is not None else ([body.banner] if body.banner else []))
+        data = {"banners": banners, "banner": banners[0] if banners else None, "tags": normalize_tags(body.tags),
+                "footer": body.footer.strip()}
+        if not (data["banners"] or data["tags"] or data["footer"]):
             raise HTTPException(400, "В пресете пусто: выбери баннер, теги или текст в конце описания")
         return preset_json(d.preset(d.save_preset(name, data)))
 
@@ -581,12 +628,12 @@ def create_app(cfg: dict | None = None) -> FastAPI:
             raise HTTPException(404, "Пресет не найден")
         pr = preset_json(r)
         banner_spec = None
-        if pr["banner"]:
+        if pr["banners"]:
             lib = library()
-            if pr["banner"]["name"] not in lib:
-                raise HTTPException(400, f"Файл баннера «{pr['banner']['name']}» из пресета удалён — сохрани пресет заново")
-            banner_spec = json.dumps(bn.normalize_spec({**pr["banner"], "path": str(lib[pr["banner"]["name"]])}, cfg),
-                                     ensure_ascii=False)
+            for sp in pr["banners"]:
+                if sp["name"] not in lib:
+                    raise HTTPException(400, f"Файл баннера «{sp['name']}» из пресета удалён — сохрани пресет заново")
+            banner_spec = bn.specs_to_json([bn.normalize_spec({**sp, "path": str(lib[sp["name"]])}, cfg) for sp in pr["banners"]])
         out = []
         for cid in body.clip_ids:
             c = d.clip(cid)
@@ -752,9 +799,16 @@ def create_app(cfg: dict | None = None) -> FastAPI:
                 info = bn.probe(p)
             except bn.BannerError:
                 continue
+            key, box = None, None
+            if info["kind"] == "video":
+                try:
+                    key = bn.detect_key(p)
+                    box = bn.content_box(p, key) if key else None
+                except Exception:   # noqa: BLE001 — хромакей необязателен, список баннеров не должен из-за него падать
+                    key, box = None, None
             out.append({"name": name, "kind": info["kind"], "has_audio": info["has_audio"],
                         "duration": round(info["duration"], 1), "width": info["w"], "height": info["h"],
-                        "size": p.stat().st_size})
+                        "size": p.stat().st_size, "key": key, "box": box})
         return out
 
     @app.put("/api/banners")
@@ -783,13 +837,15 @@ def create_app(cfg: dict | None = None) -> FastAPI:
 
     @app.get("/api/banners/describe")
     def banner_describe(name: str, start: float = 3.0, duration: float = 0.0, width_percent: float = 100.0,
-                        position: str = "center", duck_percent: int = 15, margin: int = 160):
+                        position: str = "center", duck_percent: int = 15, margin: int = 160,
+                        chroma: bool | None = None, chroma_color: str = ""):
         p = library().get(name)
         if not p:
             raise HTTPException(404, "Баннер не найден")
         try:
             spec = bn.normalize_spec({"path": str(p), "start": start, "duration": duration, "width_percent": width_percent,
-                                      "position": position, "duck_percent": duck_percent, "margin": margin}, cfg)
+                                      "position": position, "duck_percent": duck_percent, "margin": margin,
+                                      "chroma": chroma, "chroma_color": chroma_color}, cfg)
             return bn.describe_info(spec, cfg)
         except bn.BannerError as e:
             raise HTTPException(400, str(e)) from None

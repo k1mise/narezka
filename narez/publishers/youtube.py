@@ -32,18 +32,33 @@ class YouTubePublisher(Publisher):
         p = Path(self.yt["client_secrets"])
         return p if p.is_absolute() else Path(self.cfg["_root"]) / p
 
-    def authorize(self, account_id: int, port: int = 0, timeout: int = 300) -> str:
+    def client_config(self, client: dict | None = None) -> dict:
+        """Ключи Google OAuth-приложения: из аккаунта (client) -> из .env (YOUTUBE_CLIENT_ID/SECRET) -> из client_secret.json."""
+        import os
+        cid = (client or {}).get("client_id") or os.environ.get("YOUTUBE_CLIENT_ID", "")
+        sec = (client or {}).get("client_secret") or os.environ.get("YOUTUBE_CLIENT_SECRET", "")
+        if cid and sec:
+            return {"installed": {"client_id": cid.strip(), "client_secret": sec.strip(),
+                                  "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+                                  "token_uri": "https://oauth2.googleapis.com/token",
+                                  "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
+                                  "redirect_uris": ["http://localhost"]}}
+        sp = self.secrets_path()
+        if not sp.exists():
+            raise FileNotFoundError("Нет ключей YouTube: нажми «Ключи» у аккаунта и впиши Client ID и Client secret "
+                                    "(или положи файл client_secret.json, см. README, раздел «YouTube API»).")
+        import json as _json
+        return _json.loads(sp.read_text(encoding="utf-8"))
+
+    def authorize(self, account_id: int, port: int = 0, timeout: int = 300, client: dict | None = None) -> str:
         """Открывает браузер: войди в нужный Google-аккаунт и выбери канал. Токен сохраняется локально."""
         from google_auth_oauthlib.flow import InstalledAppFlow
 
-        sp = self.secrets_path()
-        if not sp.exists():
-            raise FileNotFoundError(f"Нет файла {sp}. См. README, раздел «YouTube API».")
         # select_account: Google всегда показывает выбор аккаунта (иначе берёт тот, что открыт в браузере по умолчанию)
-        creds = InstalledAppFlow.from_client_secrets_file(str(sp), SCOPES).run_local_server(
+        creds = InstalledAppFlow.from_client_config(self.client_config(client), SCOPES).run_local_server(
             port=port, timeout_seconds=timeout, prompt="select_account consent")
         path = self.token_path(account_id)
-        path.write_text(creds.to_json(), encoding="utf-8")
+        path.write_text(creds.to_json(), encoding="utf-8")  # в токене лежат и ключи приложения: дальше он обновляется сам
         return str(path)
 
     def _creds(self, account_id: int):

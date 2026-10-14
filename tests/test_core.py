@@ -263,6 +263,7 @@ def test_cleanup_after_publication(tmp_path):
     g = db.add_group("g")
     db.set_account(g, "youtube", "main"); db.set_account(g, "tiktok", "tt")
     yt = next(a["id"] for a in db.accounts(g) if a["platform"] == "youtube")
+    tt = next(a["id"] for a in db.accounts(g) if a["platform"] == "tiktok")
     j = db.add_job(g, "u", "t", str(src))
     paths = []
     for i in range(2):
@@ -272,6 +273,9 @@ def test_cleanup_after_publication(tmp_path):
     # пока ничего не опубликовано — ничего не трогаем
     assert finish_group(db, cfg, g, lambda *_: None) == 0 and src.exists() and paths[0].exists()
     db.add_publication(c1, yt, g, "youtube", "https://youtube.com/shorts/A", "A")
+    finish_group(db, cfg, g, lambda *_: None)
+    assert paths[0].exists()                                               # TikTok теперь тоже настоящая платформа: ждём и её
+    db.add_publication(c1, tt, g, "tiktok", "https://www.tiktok.com/@me/video/1", "A")
     finish_group(db, cfg, g, lambda *_: None)
     assert not paths[0].exists() and paths[1].exists() and src.exists()   # исходник нужен, пока есть клип в очереди
     assert db.clip(c1)["status"] == "published"
