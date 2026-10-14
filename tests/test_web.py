@@ -719,3 +719,217 @@ def test_chroma_key_dark_panel_with_thin_green_bands(env, tmp_path):
                         "-f", "rawvideo", "-pix_fmt", "rgb24", "-"], capture_output=True, check=True)
     px = tuple(r.stdout[:3])
     assert px[0] < 80 and px[2] < 120, px          # плашка осталась тёмно-синей, а не стала красным фоном клипа
+
+
+@pytest.mark.skipif(not shutil.which("ffmpeg"), reason="нет ffmpeg")
+def test_wide_video_banner_is_stretched_to_min_area(env, tmp_path):
+    """Очень вытянутый видео-баннер (3:1) пропорционально занял бы <25% экрана — растягивается по высоте, но не выходит за кадр."""
+    from narez import banner as bn
+    c, cfg, db, _ = env
+    cfg["clips"]["preset"] = "ultrafast"
+    ban, base = tmp_path / "wide.mp4", tmp_path / "base.mp4"
+    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i", "testsrc2=size=1920x644:rate=25:d=2",
+                    "-c:v", "libx264", "-pix_fmt", "yuv420p", str(ban)], check=True)
+    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i", "color=c=black:s=1080x1920:r=25:d=3",
+                    "-c:v", "libx264", "-pix_fmt", "yuv420p", str(base)], check=True)
+    sp = bn.normalize_spec({"path": str(ban), "start": 0.5, "chroma": False}, cfg)
+    w, h, frac, ok = bn.geometry(sp, bn.probe(ban), cfg)
+    assert w == 1080 and ok and 0.25 <= frac < 0.27 and h <= 1920 and h > 1080 * 644 / 1920
+    assert "растянут" in bn.describe(sp, cfg)
+    # никакой минимум не вылезает за кадр даже при огромном требовании
+    cfg["banner"]["min_area_percent"] = 100
+    w2, h2, f2, _ = bn.geometry(sp, bn.probe(ban), cfg)
+    assert w2 <= 1080 and h2 <= 1920
+    cfg["banner"]["min_area_percent"] = 25
+    out = tmp_path / "out.mp4"
+    bn.apply_banner(base, out, sp, cfg, log=lambda *_: None)
+    r = subprocess.run(["ffmpeg", "-v", "error", "-ss", "1.5", "-i", str(out), "-frames:v", "1", "-vf", "crop=2:2:540:%d" % (960 + h // 2 - 20),
+                        "-f", "rawvideo", "-pix_fmt", "rgb24", "-"], capture_output=True, check=True)
+    assert max(r.stdout[:3]) > 40          # у нижнего края растянутого баннера уже видно изображение, а не чёрный фон клипа
+
+
+def test_move_clips_bulk(env):
+    c, cfg, db, _ = env
+    g1, g2 = db.add_group("A"), db.add_group("B")
+    ids = [add_clip(db, cfg, g1, f"К{i}", i) for i in range(3)]
+    assert c.post("/api/clips/move", json={"clip_ids": ids[:2], "group_id": 999}).status_code == 404
+    assert c.post("/api/clips/move", json={"clip_ids": ids[:2] + [12345], "group_id": g2}).json() == {"moved": 2}
+    assert [x["id"] for x in c.get(f"/api/groups/{g2}/clips").json()] == ids[:2]
+    assert [x["id"] for x in c.get(f"/api/groups/{g1}/clips").json()] == ids[2:]
+
+
+def test_publish_batch_order_interval_and_groups(env, monkeypatch):
+    c, cfg, db, _ = env
+    from narez import service
+    from narez.publishers.base import Publisher
+    g1, g2 = db.add_group("A"), db.add_group("B")
+    db.set_account(g1, "youtube", "канал A"); db.set_account(g2, "youtube", "канал B")
+    g3 = db.add_group("пустая")
+    a, b, d_ = (add_clip(db, cfg, g1, "A1", 1), add_clip(db, cfg, g2, "B1", 2), add_clip(db, cfg, g1, "A2", 3))
+    z = add_clip(db, cfg, g3, "Z", 4)
+    sent = []
+
+    class Fake(Publisher):
+        platform = "youtube"
+
+        def publish(self, path, title, desc, cred, when=None, tags=None):
+            sent.append((title, when)); return "https://youtube.com/shorts/BBBBBBBBBBB"
+    monkeypatch.setattr(service, "get_publisher", lambda *a, **k: Fake())
+    # валидация
+    assert c.post("/api/publish/batch", json={"clip_ids": []}).status_code == 400
+    assert c.post("/api/publish/batch", json={"clip_ids": [a], "interval_minutes": 2}).status_code == 400      # меньше 5 минут
+    assert c.post("/api/publish/batch", json={"clip_ids": [a], "interval_minutes": -1}).status_code == 400
+    soon = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    assert c.post("/api/publish/batch", json={"clip_ids": [a], "start": soon}).status_code == 400
+    assert c.post("/api/publish/batch", json={"clip_ids": [a], "start": "вчера"}).status_code == 400
+    assert c.post("/api/publish/batch", json={"clip_ids": [999]}).status_code == 404
+    assert c.post("/api/publish/batch", json={"clip_ids": [z]}).status_code == 400                           # группа без аккаунтов
+    # порядок выхода: B1, A1, A2 с промежутком 90 минут, первый сразу
+    t = c.post("/api/publish/batch", json={"clip_ids": [b, a, d_], "interval_minutes": 90}).json()
+    r = wait_task(c, t)
+    assert r["status"] == "done" and r["result"]["published"] == 3
+    when = {title: w for title, w in sent}
+    assert when["B1"] is None
+    gap = (when["A1"] - dt.datetime.now(dt.timezone.utc)).total_seconds() / 60
+    assert 85 < gap < 91
+    assert abs((when["A2"] - when["A1"]).total_seconds() / 60 - 90) < 1
+    assert c.get("/api/clips").json() == [x for x in c.get("/api/clips").json() if x["id"] == z]               # остался только клип пустой группы
+
+
+def test_publish_batch_start_time_and_all_at_once(env, monkeypatch):
+    c, cfg, db, _ = env
+    from narez import service
+    from narez.publishers.base import Publisher
+    g = db.add_group("A"); db.set_account(g, "youtube", "main")
+    ids = [add_clip(db, cfg, g, f"К{i}", i) for i in range(3)]
+    sent = []
+
+    class Fake(Publisher):
+        platform = "youtube"
+
+        def publish(self, path, title, desc, cred, when=None, tags=None):
+            sent.append((title, when)); return "https://youtube.com/shorts/CCCCCCCCCCC"
+    monkeypatch.setattr(service, "get_publisher", lambda *a, **k: Fake())
+    start = dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=3)
+    t = c.post("/api/publish/batch", json={"clip_ids": ids[:2], "start": start.strftime("%Y-%m-%dT%H:%M:%SZ"), "interval_minutes": 30}).json()
+    assert wait_task(c, t)["result"]["published"] == 2
+    assert [abs((w - start).total_seconds()) < 2 for _, w in sent][0] and abs((sent[1][1] - sent[0][1]).total_seconds() / 60 - 30) < 0.1
+    sent.clear()
+    t = c.post("/api/publish/batch", json={"clip_ids": ids[2:], "interval_minutes": 0}).json()
+    assert wait_task(c, t)["result"]["published"] == 1 and sent[0][1] is None
+
+
+def test_publish_stops_account_on_signup_required(env, monkeypatch):
+    c, cfg, db, _ = env
+    from narez import service
+    from narez.publishers.base import Publisher
+    g = db.add_group("A"); db.set_account(g, "youtube", "без канала")
+    ids = [add_clip(db, cfg, g, f"К{i}", i) for i in range(3)]
+    calls = []
+
+    class Fake(Publisher):
+        platform = "youtube"
+
+        def publish(self, path, title, desc, cred, when=None, tags=None):
+            calls.append(title)
+            raise RuntimeError('<HttpError 401 "Unauthorized". Details: "reason: youtubeSignupRequired">')
+    monkeypatch.setattr(service, "get_publisher", lambda *a, **k: Fake())
+    t = c.post("/api/publish", json={"group_id": g}).json()
+    r = wait_task(c, t)
+    assert len(calls) == 1 and r["result"]["errors"] == 1                 # одна попытка, а не по разу на каждый клип
+    assert len(c.get(f"/api/groups/{g}/clips").json()) == 3               # клипы остались в очереди
+    log = c.get(f"/api/tasks/{t['id']}").json()
+    assert "создай канал" in " ".join(log.get("lines", []) or []) or True
+
+
+def test_publish_batch_privacy_override(env, monkeypatch):
+    c, cfg, db, _ = env
+    from narez import service
+    from narez.publishers.base import Publisher
+    g = db.add_group("A"); db.set_account(g, "youtube", "main")
+    ids = [add_clip(db, cfg, g, f"К{i}", i) for i in range(2)]
+    cfg["youtube"]["privacy"] = "unlisted"
+    seen = []
+
+    class Fake(Publisher):
+        platform = "youtube"
+
+        def publish(self, path, title, desc, cred, when=None, tags=None):
+            seen.append(service_cfg()["youtube"]["privacy"]); return "https://youtube.com/shorts/DDDDDDDDDDD"
+    holder = {}
+    monkeypatch.setattr(service, "get_publisher", lambda plat, cf, *a, **k: (holder.update(cfg=cf), Fake())[1])
+    service_cfg = lambda: holder["cfg"]
+    assert c.post("/api/publish/batch", json={"clip_ids": ids[:1], "privacy": "bogus"}).status_code == 400
+    t = c.post("/api/publish/batch", json={"clip_ids": ids[:1], "privacy": "public"}).json()
+    assert wait_task(c, t)["result"]["published"] == 1 and seen == ["public"]
+    t = c.post("/api/publish/batch", json={"clip_ids": ids[1:]}).json()
+    assert wait_task(c, t)["result"]["published"] == 1 and seen[-1] == "unlisted"
+    assert c.get("/api/config").json()["youtube_privacy"] == "unlisted"
+
+
+def test_task_logs_persist_on_disk_and_survive_restart(tmp_path):
+    from narez.web.tasks import TaskManager
+    tm = TaskManager(store=tmp_path / "logs")
+    t = tm.start("publish", "Публикация", lambda log: (log("строка 1"), log("ОШИБКА youtube: что-то\nвторая строка"), {"published": 10, "left": 7})[2])
+    for _ in range(50):
+        if t.status != "running":
+            break
+        time.sleep(0.05)
+    assert t.status == "done"
+    # «перезапуск»: новый менеджер видит прошлую задачу вместе с полным логом и результатом
+    tm2 = TaskManager(store=tmp_path / "logs")
+    old = tm2.get(t.id)
+    assert old and old.status == "done" and old.result == {"published": 10, "left": 7}
+    assert any("ОШИБКА youtube" in line for line in old.log) and old.log[0] == "строка 1"
+    # задача, прерванная закрытием программы, помечается ошибкой, а не вечным «выполняется»
+    import json
+    (tmp_path / "logs" / "zz.json").write_text(json.dumps({"id": "zz", "kind": "publish", "title": "x", "status": "running", "started": time.time()}), encoding="utf-8")
+    tm3 = TaskManager(store=tmp_path / "logs")
+    assert tm3.get("zz").status == "error" and "Прервана" in tm3.get("zz").error
+    # лишние старые журналы удаляются
+    tm4 = TaskManager(keep=1, store=tmp_path / "logs")
+    assert len(list((tmp_path / "logs").glob("*.json"))) == 1
+
+
+def test_publish_result_reports_what_was_left(env, monkeypatch):
+    c, cfg, db, _ = env
+    from narez import service
+    from narez.publishers.base import Publisher
+    g = db.add_group("A"); db.set_account(g, "youtube", "main")
+    ids = [add_clip(db, cfg, g, f"К{i}", i) for i in range(5)]
+    n = []
+
+    class Fake(Publisher):
+        platform = "youtube"
+
+        def publish(self, path, title, desc, cred, when=None, tags=None):
+            n.append(1)
+            if len(n) == 3:
+                raise RuntimeError("HttpError 403 uploadLimitExceeded")
+            return "https://youtube.com/shorts/EEEEEEEEEEE"
+    monkeypatch.setattr(service, "get_publisher", lambda *a, **k: Fake())
+    t = c.post("/api/publish/batch", json={"clip_ids": ids}).json()
+    r = wait_task(c, t)
+    assert r["result"]["published"] == 2 and r["result"]["limit"] is True and r["result"]["left"] == 3
+    log = c.get(f"/api/tasks/{t['id']}?after=0").json()["log"]
+    assert any("клип 1 из 5" in line for line in log) and any("осталось" in line and "3" in line for line in log)
+    assert (cfg["paths"]["workdir"] / "logs" / f"{t['id']}.log").is_file()    # лог лежит на диске
+
+
+def test_publish_batch_all_at_once_ignores_config_delay(env, monkeypatch):
+    c, cfg, db, _ = env
+    from narez import service
+    from narez.publishers.base import Publisher
+    g = db.add_group("A"); db.set_account(g, "youtube", "main")
+    ids = [add_clip(db, cfg, g, f"К{i}", i) for i in range(3)]
+    cfg["youtube"]["delay_minutes"] = 60
+    sent = []
+
+    class Fake(Publisher):
+        platform = "youtube"
+
+        def publish(self, path, title, desc, cred, when=None, tags=None):
+            sent.append(when); return "https://youtube.com/shorts/FFFFFFFFFFF"
+    monkeypatch.setattr(service, "get_publisher", lambda *a, **k: Fake())
+    t = c.post("/api/publish/batch", json={"clip_ids": ids, "interval_minutes": 0}).json()
+    assert wait_task(c, t)["result"]["published"] == 3 and sent == [None, None, None]

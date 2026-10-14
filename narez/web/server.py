@@ -136,6 +136,19 @@ class PublishIn(BaseModel):
     mode: str = "keep"  # now: очистить время клипа и выложить сразу; keep: учитывать время клипа
 
 
+class BatchPublishIn(BaseModel):
+    clip_ids: list[int]                      # порядок в списке = порядок выхода
+    start: str = ""                          # время выхода первого клипа (ISO UTC); пусто = сразу
+    interval_minutes: float = 0              # промежуток между выходами; 0 = все сразу
+    account_ids: Optional[list[int]] = None  # None = все аккаунты группы каждого клипа
+    privacy: str = ""                        # видимость YouTube для клипов, которые выходят сразу: public/unlisted/private; пусто = из config.toml
+
+
+class MoveClipsIn(BaseModel):
+    clip_ids: list[int]
+    group_id: int
+
+
 class ImportIn(BaseModel):
     urls: str
     group_id: int
@@ -146,8 +159,8 @@ def create_app(cfg: dict | None = None) -> FastAPI:
     DB(cfg["paths"]["db"])  # создаёт/обновляет схему один раз при старте
     app = FastAPI(title="narez", docs_url=None, redoc_url=None, openapi_url=None)
     app.state.cfg = cfg
-    tasks = app.state.tasks = TaskManager()
     wd: Path = cfg["paths"]["workdir"]
+    tasks = app.state.tasks = TaskManager(store=wd / "logs")   # журнал задач хранится на диске (workspace/logs)
     (wd / "banners").mkdir(parents=True, exist_ok=True)
     health_cache: dict = {"t": 0, "v": None}
     logins: dict = {}
@@ -263,7 +276,7 @@ def create_app(cfg: dict | None = None) -> FastAPI:
     def config():
         return {"llm_model": cfg["llm"]["model"], "delay_minutes": cfg["youtube"].get("delay_minutes", 0),
                 "privacy": cfg["youtube"].get("privacy"), "min_clip": cfg["clips"]["min_seconds"],
-                "max_clip": cfg["clips"]["max_seconds"], "max_banners": max_banners(), "min_area_percent": cfg["banner"].get("min_area_percent", 25),
+                "max_clip": cfg["clips"]["max_seconds"], "max_banners": max_banners(), "youtube_privacy": cfg["youtube"].get("privacy", "private"), "min_area_percent": cfg["banner"].get("min_area_percent", 25),
                 "min_ahead_minutes": int(schedule.MIN_AHEAD.total_seconds() // 60), "platforms": PLATFORMS,
                 "real_platforms": sorted(REAL_PLATFORMS),
                 "banner_defaults": {"image": {k: v for k, v in bn.default_spec(cfg, "x.png").items() if k != "path"},
@@ -895,6 +908,85 @@ def create_app(cfg: dict | None = None) -> FastAPI:
             return service.publish_clips(DB(cfg["paths"]["db"], init=False), cfg, body.group_id, ids, log,
                                          delete_sources=not keep_sources, account_ids=targets or None)
         return started("publish", f"Публикация: {len(ids)} клип(ов)", fn, exclusive=True)
+
+    @app.post("/api/clips/move")
+    def move_clips(body: MoveClipsIn, d: DB = Depends(get_db)):
+        """Переносит несколько клипов в другую группу (вопрос «применить ко всем клипам группы» в редакторе)."""
+        need_group(d, body.group_id)
+        ids = [i for i in dict.fromkeys(body.clip_ids) if d.clip(i) and d.clip(i)["status"] == "ready"]
+        for i in ids:
+            d.update_clip(i, group_id=body.group_id)
+        return {"moved": len(ids)}
+
+    @app.post("/api/publish/batch")
+    def publish_batch(body: BatchPublishIn, d: DB = Depends(get_db)):
+        """Публикация выбранных клипов в заданном порядке с промежутком между выходами.
+        Время i-го клипа = start + i·interval (start пусто → первый сразу, остальные от текущего момента)."""
+        from datetime import datetime, timedelta, timezone
+        order = list(dict.fromkeys(body.clip_ids))
+        if not order:
+            raise HTTPException(400, "Не выбрано ни одного клипа")
+        interval = float(body.interval_minutes or 0)
+        min_gap = schedule.MIN_AHEAD.total_seconds() / 60
+        if interval < 0 or (0 < interval < min_gap):
+            raise HTTPException(400, f"Промежуток между выходами: 0 (все сразу) или не меньше {int(min_gap)} минут")
+        now = datetime.now(timezone.utc)
+        start = None
+        if (body.start or "").strip():
+            start = schedule.from_iso(body.start.strip())
+            if not start:
+                raise HTTPException(400, "Неверный формат времени начала")
+            if start < now + schedule.MIN_AHEAD:
+                raise HTTPException(400, f"Время начала должно быть минимум на {int(min_gap)} минут позже текущего")
+        targets = []
+        for i in dict.fromkeys(body.account_ids or []):
+            a = d.account(i)
+            if not a:
+                raise HTTPException(404, "Аккаунт не найден")
+            if a["platform"] not in REAL_PLATFORMS:
+                raise HTTPException(400, f"Публикация на {a['platform']} пока не поддерживается")
+            targets.append(i)
+        groups: dict[int, list[int]] = {}
+        for pos, cid in enumerate(order):
+            c = d.clip(cid)
+            if not c or c["status"] != "ready":
+                raise HTTPException(404, f"Клип {cid} не найден или уже опубликован")
+            if (d.job(c["job_id"]) or {"test": 0})["test"]:
+                raise HTTPException(400, "Тестовые клипы не публикуются")
+            gid = d.clip_group(c)
+            if not gid or (not targets and not d.accounts(gid)):
+                raise HTTPException(400, f"У клипа «{c['title']}» группа без аккаунтов")
+            groups.setdefault(gid, []).append(cid)
+        for pos, cid in enumerate(order):
+            if start is not None:
+                when = start + timedelta(minutes=interval * pos)
+            elif interval and pos > 0:
+                when = now + timedelta(minutes=interval * pos)
+            else:
+                when = None
+            d.update_clip(cid, publish_at=schedule.to_iso(when) if when else "")
+        keep_sources = tasks.running("process")
+        if body.privacy and body.privacy not in ("public", "unlisted", "private"):
+            raise HTTPException(400, "Видимость: public, unlisted или private")
+        # время каждого клипа уже задано выше, поэтому общая «задержка между клипами» из config.toml здесь не нужна:
+        # иначе при «все сразу» клипы со второго уходили бы с задержкой из конфига
+        run_cfg = {**cfg, "youtube": {**cfg["youtube"], "delay_minutes": 0, **({"privacy": body.privacy} if body.privacy else {})}}
+
+        def fn(log):
+            total = {"published": 0, "errors": 0, "scheduled": 0, "left": 0, "limit": False, "total": len(order)}
+            db2 = DB(cfg["paths"]["db"], init=False)
+            for gid, ids in groups.items():
+                r = service.publish_clips(db2, run_cfg, gid, ids, log, delete_sources=not keep_sources, account_ids=targets or None)
+                total["published"] += r.get("published", 0)
+                total["errors"] += r.get("errors", 0)
+                total["scheduled"] += r.get("scheduled", 0)
+                total["left"] += r.get("left", 0)
+                if r.get("limit"):
+                    total["limit"] = True
+                    break
+            total["left"] = sum(1 for i in order if (d_ := db2.clip(i)) and d_["status"] == "ready")
+            return total
+        return started("publish", f"Публикация: {len(order)} клип(ов)", fn, exclusive=True)
 
     # ---------- очередь отложенных публикаций (Instagram/TikTok) ----------
     @app.get("/api/scheduled")

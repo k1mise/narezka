@@ -276,6 +276,9 @@ def geometry(spec: dict, info: dict, cfg: dict) -> tuple[int, int, float, bool]:
     w = min(w, W, H * aspect)
     w = max(int(w) // 2 * 2, 2)
     h = max(int(w / aspect) // 2 * 2, 2)
+    if info["kind"] == "video" and w * h < min_area * W * H:
+        # пропорционально больше уже нельзя (упёрлись в ширину кадра) — растягиваем по высоте непропорционально, но не выше кадра
+        h = max(min(int(min_area * W * H / w) + 2, H) // 2 * 2, h)
     frac = w * h / (W * H)
     return w, h, frac, info["kind"] != "video" or frac >= min_area - 0.005
 
@@ -290,10 +293,13 @@ def describe_info(spec: dict, cfg: dict) -> dict:
     else:
         snd = "со звуком" if info["has_audio"] else "без звука"
         text = f"Видео {info['w']}×{info['h']}, {info['duration']:.1f} с, {snd}; займёт {frac * 100:.0f}% экрана"
-        text += " ✓" if ok else f" — МЕНЬШЕ {min_area}%: у баннера слишком вытянутая форма."
+        text += " ✓" if ok else f" — МЕНЬШЕ {min_area}%: даже с растягиванием на весь кадр не хватает места."
         if spec.get("chroma"):
             ei = effective_info(spec, info, cfg)
             text = text.rstrip(".") + f". Фон {spec.get('chroma_color')} вырезан" + (f", видимая часть {ei['w']}×{ei['h']}" if ei["crop"] else "")
+    ei = effective_info(spec, info, cfg)
+    if info["kind"] == "video" and h > w / (ei["w"] / ei["h"]) * 1.03:
+        text += f" (растянут по высоте на {round((h * ei['w'] / ei['h'] / w - 1) * 100)}%, чтобы занять {min_area}% экрана)"
     return {"kind": info["kind"], "has_audio": info["has_audio"], "duration": info["duration"],
             "width": info["w"], "height": info["h"], "out_w": w, "out_h": h, "area_percent": round(frac * 100, 1), "ok": ok, "text": text}
 

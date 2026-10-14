@@ -11,6 +11,11 @@ from .meta import api_tags, compose_description
 from .publishers import get_publisher
 from .publishers.base import NATIVE_SCHEDULE, REAL_PLATFORMS
 
+SIGNUP_MSG = ("у этого Google-аккаунта нет канала YouTube (youtubeSignupRequired). Открой youtube.com под этим аккаунтом и создай канал "
+              "(аватар → «Создать канал»), затем в разделе «Аккаунты» нажми «Войти» заново и на экране Google выбери именно этот канал. "
+              "Клипы остались в очереди.")
+TOKEN_MSG = ("доступ к аккаунту истёк или отозван (invalid_grant). Зайди в «Аккаунты» и войди в этот аккаунт заново — "
+             "в Google Cloud в режиме «Тестирование» вход действует всего 7 дней.")
 LIMIT_MSG = ("дневной лимит загрузок канала исчерпан. Остальные клипы остались в очереди — опубликуй их позже "
              "(лимит снимается примерно через сутки; подтверждение канала по телефону на youtube.com/verify поднимает его).")
 
@@ -82,6 +87,8 @@ def publish_clips(db, cfg: dict, group_id: int, clip_ids: list[int], log=print, 
                 res["scheduled"] = res.get("scheduled", 0) + 1
                 log(f"{a['platform']}: клип «{clip['title']}» выложу в {when.astimezone():%d.%m %H:%M} (программа должна быть запущена).")
                 continue
+            log(f"{a['platform']} · {a['label']}: клип {todo.index(cid) + 1} из {len(todo)} «{clip['title']}»"
+                + (f" — на {when.astimezone():%d.%m %H:%M}" if when else " — сразу"))
             try:
                 url = send_one(db, cfg, a, clip, when, log)
                 res["published"] += 1
@@ -91,12 +98,19 @@ def publish_clips(db, cfg: dict, group_id: int, clip_ids: list[int], log=print, 
                     log(f"{a['platform']}: {LIMIT_MSG}")
                     res["limit"] = True
                     break
+                if "youtubeSignupRequired" in str(e) or "invalid_grant" in str(e):
+                    # одна и та же причина для всех клипов этого аккаунта — не долбим API, остальные аккаунты продолжают
+                    log(f"ОШИБКА {a['platform']} · {a['label']}: " + (SIGNUP_MSG if "youtubeSignupRequired" in str(e) else TOKEN_MSG))
+                    res["errors"] += 1
+                    break
                 res["errors"] += 1
                 log(f"ОШИБКА {a['platform']}: {e}")
     finish_group(db, cfg, group_id, log, delete_sources=delete_sources,
                  only=clip_ids if account_ids else None,
                  real_ids={a["id"] for a in accs if a["platform"] in REAL_PLATFORMS} if account_ids else None)
-    log("Публикация завершена.")
+    res["left"] = sum(1 for i in clip_ids if (c := db.clip(i)) and c["status"] == "ready")
+    log(f"Итог: загружено сразу — {res['published']}, ошибок — {res['errors']}, в очереди на выход позже — {res.get('scheduled', 0)}, "
+        f"осталось в «Готово к публикации» — {res['left']}.")
     return res
 
 

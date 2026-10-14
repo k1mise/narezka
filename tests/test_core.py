@@ -302,7 +302,7 @@ def test_banner_geometry():
     w, h, frac, ok = geometry({"width_percent": 40}, {"kind": "video", "w": 1280, "h": 720}, cfg)
     assert ok and frac >= 0.25 and w <= 1080                               # узкий видео-баннер растянулся до 25%+
     w, h, frac, ok = geometry({"width_percent": 100}, {"kind": "video", "w": 3000, "h": 1000}, cfg)
-    assert not ok                                                          # слишком вытянутый: 25% не набрать
+    assert ok and frac >= 0.25 and w == 1080 and h <= 1920                 # слишком вытянутый: растянут по высоте непропорционально, в кадре
     w, h, frac, ok = geometry({"width_percent": 30}, {"kind": "image", "w": 600, "h": 200}, cfg)
     assert ok and w == 324                                                 # картинка: ширина как задана, минимум не навязываем
 

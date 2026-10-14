@@ -160,6 +160,7 @@ async function pollTasks() {
       if (t.status === "running" && S.tracked) S.tracked.add(t.id);
     }
     S.tasks = list;
+    if (!S.tasksLoaded) { S.tasksLoaded = true; if (S.page === "panel" && list.length && !document.activeElement?.matches("input,textarea")) setTimeout(render, 0); }   // журнал прошлых запусков появляется после первой загрузки
     // лог активной задачи
     const act = list.find(t => t.status === "running") || list.find(t => t.id === S.trackId);
     if (act) {
@@ -179,7 +180,15 @@ async function onTaskDone(t) {
   if (t.status === "error" && t.kind === "login" && /отменён/.test(t.error || "")) { /* отмену пользователь сделал сам */ }
   else if (t.status === "error") toast(`${t.title}: ${t.error}`, "err");
   else if (t.kind === "process") toast(`Нарезка готова: клипов — ${t.result.clips ?? 0}`);
-  else if (t.kind === "publish") toast("Публикация завершена");
+  else if (t.kind === "publish") {
+    const r = t.result || {}, bad = (r.errors || 0) > 0 || r.limit || (r.left || 0) > 0;
+    const parts = [`загружено: ${r.published ?? 0}`];
+    if (r.scheduled) parts.push(`ждут своего времени (IG/TikTok): ${r.scheduled}`);
+    if (r.errors) parts.push(`ошибок: ${r.errors}`);
+    if (r.left) parts.push(`осталось в очереди: ${r.left}`);
+    if (r.limit) parts.push("упёрлись в дневной лимит канала");
+    toast("Публикация завершена — " + parts.join(", ") + (bad ? ". Подробности — в журнале на «Панели»" : ""), bad ? "err" : undefined);
+  }
   else if (t.kind === "login") toast("Вход выполнен");
   else if (t.kind === "stats") toast("Статистика обновлена");
   else if (t.kind === "import") toast(`Добавлено видео: ${t.result.added ?? 0}`);
@@ -249,13 +258,26 @@ function pagePanel(page) {
   page.append(h("div", {id: "runbox"}));
   page.append(filesCard());
   const mine = S.clips.filter(c => c.group_id === S.gid), n = mine.length;
+  S.sel = new Set([...(S.sel || [])].filter(id => S.clips.some(c => c.id === id && !c.test)));
+  const selBtn = h("button", {class: "btn primary"}, "");
+  const selCbs = [];
+  const updSel = () => { selBtn.textContent = S.sel.size ? `Опубликовать выбранные (${S.sel.size})` : "Выбери клипы для публикации"; selBtn.disabled = !S.sel.size; };
+  selBtn.onclick = () => publishWindow([...S.sel]);
+  const pubable = mine.filter(c => !c.test);
+  const setAll = on => { pubable.forEach(c => on ? S.sel.add(c.id) : S.sel.delete(c.id)); selCbs.forEach(([cb, c]) => { cb.checked = S.sel.has(c.id); }); updSel(); };
   page.append(h("div", {class: "card"}, h("h2", {}, "Готово к публикации", h("small", {}, `группа «${g.name}»`)),
     n ? [h("div", {class: "row"}, h("div", {class: "grow"}, h("b", {}, `${n} ${plural(n, "клип", "клипа", "клипов")} в очереди`),
         h("div", {class: "muted small"}, `Аккаунтов в группе: ${g.accounts.length}`)),
       h("button", {class: "btn", onclick: () => go("editor")}, "Открыть редактор"),
-      h("button", {class: "btn primary", onclick: () => publish(null, "keep")}, "Опубликовать все")),
+      h("button", {class: "btn", onclick: () => { if (!pubable.length) return toast("Тестовые клипы не публикуются", "err"); publishWindow(pubable.map(c => c.id)); }}, "Опубликовать все")),
+      h("div", {class: "row", style: {marginTop: "12px", gap: "8px", flexWrap: "wrap"}},
+        h("button", {class: "btn sm", onclick: () => setAll(S.sel.size < pubable.length)}, "Выбрать / снять все"),
+        h("button", {class: "btn sm", title: "Отметить клипы всех групп", onclick: () => { S.clips.filter(c => !c.test).forEach(c => S.sel.add(c.id)); render(); }}, "Выбрать клипы всех групп"),
+        h("div", {class: "grow"}), selBtn),
       h("div", {style: {marginTop: "12px"}}, nameToggle(() => render())),
       h("div", {style: {marginTop: "10px"}}, mine.map(c => h("div", {class: "task"},
+        (() => { const cb = h("input", {type: "checkbox", disabled: c.test, title: c.test ? "Тестовые клипы не публикуются" : "Выбрать для публикации", style: {flex: "none"}});
+          cb.checked = S.sel.has(c.id); cb.onchange = () => { cb.checked ? S.sel.add(c.id) : S.sel.delete(c.id); updSel(); }; selCbs.push([cb, c]); return cb; })(),
         h("div", {class: "thumb", style: Object.assign({width: "34px", height: "60px"}, c.has_thumb ? {backgroundImage: `url(/api/clips/${c.id}/thumb)`} : {})}, c.has_thumb ? "" : "нет"),
         h("div", {class: "t"}, h("b", {}, clipLabel(c)), h("span", {class: "muted small"}, `${Math.round(c.duration)} с${c.test ? " · тест" : ""}${c.banner ? " · баннер" : ""}`)),
         h("button", {class: "btn sm", onclick: () => ask("Переименовать клип", "Название, с которым клип будет опубликован", c.title, "Сохранить", async v => {
@@ -264,16 +286,30 @@ function pagePanel(page) {
         h("button", {class: "btn sm danger", onclick: () => confirmBox("Удалить клип?", `«${c.title}» будет убран из очереди, файл удалён с диска.`, "Удалить", async () => {
           try { await api("DELETE", `/api/clips/${c.id}`); await loadClips(); toast("Клип удалён"); render(); } catch (e) { fail(e); } })}, "Удалить"))))]
       : h("div", {class: "muted"}, "Пока пусто — вставь ссылку выше.")));
-  const hist = S.tasks.filter(t => t.status !== "running").slice(0, 6);
-  if (hist.length) page.append(h("div", {class: "card"}, h("h2", {}, "Недавние задачи"), hist.map(t =>
-    h("div", {class: "task"}, h("div", {class: "t"}, h("b", {}, t.title), h("span", {class: "muted small"}, t.status === "error" ? t.error : (t.last || ""))),
-      h("span", {class: "badge " + (t.status === "done" ? "ok" : "err")}, t.status === "done" ? "готово" : "ошибка")))));
+  updSel();
+  const hist = S.tasks.filter(t => t.status !== "running").slice(0, 15);
+  if (hist.length) page.append(h("div", {class: "card"}, h("h2", {}, "Журнал задач", h("small", {}, "хранится на диске, нажми на задачу — откроется полный лог")), hist.map(t => {
+    const r = t.result || {}, warn = t.status === "done" && (r.errors || r.limit || r.left);
+    const when = t.started ? new Date(t.started * 1000).toLocaleString("ru-RU", {day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit"}) : "";
+    const box = h("pre", {class: "log", style: {display: "none", marginTop: "8px", maxHeight: "320px", overflow: "auto", whiteSpace: "pre-wrap"}});
+    const sum = t.kind === "publish" && t.status === "done" ? ` · загружено ${r.published ?? 0}${r.errors ? `, ошибок ${r.errors}` : ""}${r.left ? `, осталось ${r.left}` : ""}${r.limit ? ", лимит канала" : ""}` : "";
+    const row = h("div", {class: "task", style: {cursor: "pointer", flexWrap: "wrap"}, onclick: async () => {
+      if (box.style.display === "none") {
+        box.style.display = "block"; box.textContent = "Загружаю…";
+        try { const d = await api("GET", `/api/tasks/${t.id}?after=0`); box.textContent = d.log.join("\n") || "(лог пуст)"; box.scrollTop = box.scrollHeight; } catch (e) { box.textContent = e.message; }
+      } else box.style.display = "none";
+    }}, h("div", {class: "t"}, h("b", {}, t.title), h("span", {class: "muted small"}, `${when}${sum}${t.status === "error" ? " · " + t.error : ""}`)),
+      h("span", {class: "badge " + (t.status === "done" ? (warn ? "warn" : "ok") : "err")}, t.status === "done" ? (warn ? "с замечаниями" : "готово") : "ошибка"));
+    return h("div", {}, row, box);
+  })));
   updateRunBox();
 }
 function updateRunBox() {
   const box = $("#runbox"); if (!box) return;
   const t = S.tasks.find(x => x.id === S.trackId) || S.tasks.find(x => x.status === "running");
-  if (!t || (t.status !== "running" && Date.now() / 1000 - t.finished > 60 && t.kind !== "process")) { box.replaceChildren(); return; }
+  const problem = t && t.status !== "running" && (t.status === "error" || (t.result && (t.result.errors || t.result.limit || t.result.left)));
+  S.hidden = S.hidden || new Set();
+  if (!t || S.hidden.has(t.id) || (t.status !== "running" && !problem && Date.now() / 1000 - t.finished > 60 && t.kind !== "process")) { box.replaceChildren(); return; }
   const buf = (S.log[t.id] && S.log[t.id].lines) || [];
   let body = [];
   if (t.kind === "process") {
@@ -286,10 +322,85 @@ function updateRunBox() {
   body.push(lg);
   const old = box.firstChild && $(".log", box);
   const stick = !old || old.scrollTop + old.clientHeight >= old.scrollHeight - 30;
-  box.replaceChildren(h("div", {class: "card"}, h("h2", {}, t.title, h("small", {}, t.status === "running" ? "выполняется…" : t.status === "done" ? "готово" : "ошибка")), body));
+  box.replaceChildren(h("div", {class: "card"}, h("h2", {}, t.title, h("small", {}, t.status === "running" ? "выполняется…" : t.status === "done" ? (problem ? "завершено с замечаниями" : "готово") : "ошибка"),
+    t.status !== "running" ? h("button", {class: "btn sm", style: {marginLeft: "auto"}, onclick: () => { S.hidden.add(t.id); updateRunBox(); }}, "Скрыть") : null), body));
   if (stick) lg.scrollTop = lg.scrollHeight;
 }
 const platName = p => (PLAT[p] || ["", p])[1];
+const fmtDur = sec => { sec = Math.round(sec); return sec >= 60 ? `${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, "0")}` : `${sec} с`; };
+/* окно публикации выбранных клипов: порядок выхода, промежуток, время начала */
+function publishWindow(ids) {
+  const cfg0 = S.cfg || {};
+  let order = ids.filter(id => S.clips.some(c => c.id === id));
+  if (!order.length) return toast("Нет клипов для публикации", "err");
+  const d = $("#dlg");
+  const unit = h("select", {style: {width: "110px"}}, [["60", "часов"], ["1", "минут"]].map(([v, t]) => h("option", {value: v}, t)));
+  const amount = h("input", {type: "number", min: "0", step: "any", value: "1", style: {width: "90px"}});
+  const startMode = h("select", {}, [["now", "Первый — сразу"], ["at", "Первый — в указанное время"]].map(([v, t]) => h("option", {value: v}, t)));
+  const startAt = h("input", {type: "datetime-local", value: isoToInput(new Date(Date.now() + 3600e3).toISOString())});
+  const chips = h("div", {class: "row", style: {gap: "6px", flexWrap: "wrap"}}, [[0, "Все сразу"], [15, "15 мин"], [30, "30 мин"], [60, "1 ч"], [120, "2 ч"], [180, "3 ч"], [360, "6 ч"]].map(([m, t]) =>
+    h("button", {class: "btn sm", type: "button", onclick: () => { if (m >= 60) { unit.value = "60"; amount.value = m / 60; } else { unit.value = "1"; amount.value = m; } draw(); }}, t)));
+  const list = h("div", {style: {maxHeight: "46vh", overflow: "auto", margin: "12px 0", border: "1px solid var(--border)", borderRadius: "12px"}});
+  const hint = h("div", {class: "note"}), err = h("div", {class: "note warn", style: {display: "none"}});
+  const PRIV = {public: "Публично", unlisted: "Доступно по ссылке", private: "Закрытое"};
+  const privSel = h("select", {}, Object.entries(PRIV).map(([v, t]) => h("option", {value: v}, t + (v === cfg0.youtube_privacy ? " (как в config.toml)" : ""))));
+  privSel.value = cfg0.youtube_privacy in PRIV ? cfg0.youtube_privacy : "private";
+  const intervalMin = () => Math.max(0, Number(amount.value) || 0) * Number(unit.value);
+  const startDate = () => startMode.value === "at" && startAt.value ? new Date(startAt.value) : null;
+  const whenOf = i => { const iv = intervalMin(), st = startDate();
+    if (st) return new Date(st.getTime() + iv * i * 60e3);
+    return iv && i > 0 ? new Date(Date.now() + iv * i * 60e3) : null; };
+  function draw() {
+    startAt.style.display = startMode.value === "at" ? "" : "none";
+    const iv = intervalMin();
+    list.replaceChildren(...order.map((id, i) => {
+      const c = S.clips.find(x => x.id === id), g = S.groups.find(x => x.id === c.group_id);
+      const w = whenOf(i), nb = (c.banners || []).length;
+      const mv = (txt, dis, fn) => h("button", {class: "btn sm", type: "button", disabled: dis, style: {padding: "2px 8px"}, onclick: fn}, txt);
+      return h("div", {class: "task", style: {padding: "8px 10px", gap: "10px", flexWrap: "wrap"}},
+        h("div", {class: "muted", style: {width: "22px", textAlign: "right", flex: "none"}}, i + 1),
+        h("div", {class: "thumb", style: Object.assign({width: "34px", height: "60px", flex: "none"}, c.has_thumb ? {backgroundImage: `url(/api/clips/${c.id}/thumb)`} : {})}, c.has_thumb ? "" : "нет"),
+        h("div", {class: "t", style: {minWidth: "160px", flex: "1"}}, h("b", {title: clipLabel(c)}, clipLabel(c)),
+          h("span", {class: "muted small"}, `${fmtDur(c.duration)} · ` + (g ? `${g.name}: ${g.accounts.map(a => platName(a.platform)).join(", ") || "нет аккаунтов"}` : "без группы"))),
+        h("span", {class: "badge " + (nb ? "acc" : "")}, nb ? (nb > 1 ? `баннеры ×${nb}` : "баннер") : "без баннера"),
+        h("div", {class: "small", style: {width: "128px", flex: "none", textAlign: "right", color: w ? "var(--text)" : "var(--ok)"}}, w ? fmtLocal(w.toISOString()) : "сразу"),
+        mv("▲", i === 0, () => { [order[i - 1], order[i]] = [order[i], order[i - 1]]; draw(); }),
+        mv("▼", i === order.length - 1, () => { [order[i + 1], order[i]] = [order[i], order[i + 1]]; draw(); }),
+        mv("✕", false, () => { order.splice(i, 1); if (!order.length) { d.close(); return; } draw(); }));
+    }));
+    const total = order.length, last = whenOf(total - 1);
+    hint.className = "note";
+    hint.textContent = iv === 0 && !startDate() ? "Все клипы уйдут сразу, один за другим."
+      : `Интервал ${iv ? (iv % 60 === 0 ? iv / 60 + " ч" : iv + " мин") : "0"}${last ? `; последний клип выйдет ${fmtLocal(last.toISOString())}` : ""}.`;
+    err.style.display = "none";
+  }
+  [unit, amount, startMode, startAt].forEach(el => el.addEventListener("input", draw));
+  const go1 = h("button", {class: "btn primary", onclick: async () => {
+    const iv = intervalMin(), st = startDate();
+    const fail1 = m => { err.textContent = m; err.style.display = ""; };
+    if (iv > 0 && iv < 5) return fail1("Промежуток между выходами: 0 (все сразу) или не меньше 5 минут.");
+    if (startMode.value === "at" && (!st || st.getTime() < Date.now() + 5 * 60e3)) return fail1("Время начала должно быть минимум на 5 минут позже текущего.");
+    go1.disabled = true;
+    try {
+      const t = await api("POST", "/api/publish/batch", {clip_ids: order, start: st ? st.toISOString() : "", interval_minutes: iv, privacy: privSel.value});
+      d.close(); S.sel = new Set(); startTracking(t); toast("Публикую…"); go("panel"); if (S.page === "panel") render();
+    } catch (e) { go1.disabled = false; fail1(e.message || String(e)); }
+  }}, "Опубликовать");
+  d.replaceChildren(h("div", {}, h("h3", {}, `Публикация: ${order.length} ${plural(order.length, "клип", "клипа", "клипов")}`),
+    h("div", {class: "muted small"}, "Порядок выхода сверху вниз. Каждый клип уйдёт на все аккаунты своей группы."),
+    list,
+    h("div", {class: "row", style: {gap: "10px", flexWrap: "wrap", alignItems: "center"}}, h("b", {}, "Промежуток между выходами:"), amount, unit),
+    h("div", {style: {margin: "8px 0"}}, chips),
+    h("div", {class: "row", style: {gap: "10px", flexWrap: "wrap", alignItems: "center", marginBottom: "10px"}}, startMode, startAt),
+    h("div", {class: "row", style: {gap: "10px", flexWrap: "wrap", alignItems: "center", marginBottom: "10px"}}, h("b", {}, "YouTube, клипы без времени (выходят сразу):"), privSel,
+      h("span", {class: "muted small"}, "Клипы с временем YouTube держит закрытыми и сам открывает публично в назначенный момент.")),
+    hint, err),
+    h("div", {class: "acts"}, h("button", {class: "btn ghost", onclick: () => d.close()}, "Отмена"), go1));
+  d.style.width = "min(820px, calc(100vw - 32px))";
+  d.addEventListener("close", () => { d.style.width = ""; }, {once: true});
+  draw();
+  d.showModal();
+}
 async function publish(ids, mode, accIds, gid) {
   const g = S.groups.find(x => x.id === (gid || S.gid));
   if (!accIds && !g.accounts.length) return toast("В группе нет аккаунтов", "err");
@@ -441,7 +552,10 @@ async function buildEditor(root) {
     let w = GW * s.width_percent / 100;
     if (b.kind === "video") w = Math.max(w, Math.sqrt((cfg.min_area_percent / 100) * GW * GH * aspect));
     w = Math.min(w, GW, GH * aspect);
-    return {w, h: w / aspect};
+    let h = w / aspect;
+    // меньше минимальной площади, а по ширине уже упёрлись в кадр — растягиваем по высоте непропорционально (как на сервере)
+    if (b.kind === "video" && w * h < (cfg.min_area_percent / 100) * GW * GH) h = Math.min(GH, Math.max(h, (cfg.min_area_percent / 100) * GW * GH / w));
+    return {w, h};
   }
   function bannerDur(s, b) {
     return b.kind === "video" ? (s.duration > 0 ? Math.min(s.duration, b.duration) : b.duration) : (s.duration > 0 ? s.duration : cfg.banner_defaults.image.duration || 6);
@@ -480,7 +594,7 @@ async function buildEditor(root) {
     const y = s.position === "top" ? s.margin : s.position === "bottom" ? GH - g.h - s.margin : (GH - g.h) / 2;
     const e = card.ovEl;
     e.style.display = "block";
-    e.style.left = ((GW - g.w) / 2 / GW * 100) + "%"; e.style.width = (g.w / GW * 100) + "%"; e.style.top = (y / GH * 100) + "%";
+    e.style.left = ((GW - g.w) / 2 / GW * 100) + "%"; e.style.width = (g.w / GW * 100) + "%"; e.style.height = (g.h / GH * 100) + "%"; e.style.objectFit = "fill"; e.style.top = (y / GH * 100) + "%";
     if (b.kind === "video") {
       const bx = visBox(s, b);
       e.style.objectViewBox = bx ? `inset(${bx[1] * 100}% ${(1 - bx[2]) * 100}% ${(1 - bx[3]) * 100}% ${bx[0] * 100}%)` : "none";
@@ -697,8 +811,21 @@ async function buildEditor(root) {
     const gsel = h("select", {style: {width: "100%"}}, S.groups.map(g => h("option", {value: g.id}, g.name)));
     gsel.value = c.group_id;
     gsel.onchange = async () => {
-      try { await save(true); const r = await api("PATCH", `/api/clips/${c.id}`, {group_id: Number(gsel.value)}); Object.assign(c, r);
-        const i = S.clips.findIndex(x => x.id === c.id); if (i >= 0) S.clips[i] = r; toast(`Клип перенесён в группу «${r.group}»`); render(); } catch (e) { fail(e); gsel.value = c.group_id; }
+      const to = Number(gsel.value), from = c.group_id;
+      if (to === from) return;
+      const nameOf = id => (S.groups.find(x => x.id === id) || {name: "?"}).name;
+      const others = S.clips.filter(x => x.group_id === from && x.id !== c.id && !x.test);
+      const doMove = async ids => {
+        try { await save(true); const r = await api("POST", "/api/clips/move", {clip_ids: ids, group_id: to});
+          await loadClips(); toast(ids.length > 1 ? `Перенесено клипов: ${r.moved} → «${nameOf(to)}»` : `Клип перенесён в группу «${nameOf(to)}»`); render(); }
+        catch (e) { fail(e); gsel.value = from; }
+      };
+      if (!others.length) return doMove([c.id]);
+      $("#dlg").addEventListener("close", () => { if (gsel.isConnected && Number(gsel.value) !== c.group_id) gsel.value = c.group_id; }, {once: true});
+      dialog(h("div", {}, h("h3", {}, "Сменить группу?"),
+        h("div", {class: "muted"}, `Клип пойдёт в группу «${nameOf(to)}». В группе «${nameOf(from)}» есть ещё ${others.length} ${plural(others.length, "клип", "клипа", "клипов")}. Применить это изменение ко всем клипам группы «${nameOf(from)}» (всего ${others.length + 1})?`)),
+        [{text: "Отмена", cls: "ghost"}, {text: "Только этот клип", fn: () => doMove([c.id])},
+         {text: `Все клипы группы (${others.length + 1})`, cls: "primary", fn: () => doMove([c.id, ...others.map(x => x.id)])}]);
     };
     targetBox.replaceChildren(sel ? "" : h("div", {class: "field"}, h("label", {}, "Группа"), gsel), h("div", {class: "field"}, h("label", {}, "Куда публиковать"), seg,
       sel ? h("div", {style: {marginTop: "10px"}}, S.groups.map(g => g.accounts.length ? h("div", {style: {marginBottom: "8px"}},
