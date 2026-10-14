@@ -667,3 +667,30 @@ def test_chroma_key_render_makes_background_transparent(env, tmp_path):
             assert edge[2] > 100 and edge[1] < 80                      # на месте фона — исходный синий кадр, зелёного нет
         else:
             assert edge[1] > 120 and edge[2] < 100                     # без хромакея фон баннера остаётся зелёным
+
+
+@pytest.mark.skipif(not shutil.which("ffmpeg"), reason="нет ffmpeg")
+def test_chroma_key_ignores_black_letterbox_bars(env, tmp_path):
+    """Чёрные полосы по верху/низу кадра зелёного баннера не должны попадать в результат."""
+    from narez import banner as bn
+    c, cfg, db, _ = env
+    cfg["clips"]["preset"] = "ultrafast"
+    bars, base = tmp_path / "bars.mp4", tmp_path / "base.mp4"
+    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i", "color=c=0x00b140:s=1280x720:r=25:d=2",
+                    "-f", "lavfi", "-i", "color=c=0xc83c3c:s=700x300:r=25:d=2", "-filter_complex",
+                    "[0][1]overlay=(W-w)/2:(H-h)/2,drawbox=x=0:y=0:w=1280:h=14:color=black:t=fill,"
+                    "drawbox=x=0:y=706:w=1280:h=14:color=black:t=fill[v]", "-map", "[v]", "-c:v", "libx264",
+                    "-pix_fmt", "yuv420p", str(bars)], check=True)
+    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i", "color=c=0x2020a0:s=1080x1920:r=25:d=3",
+                    "-c:v", "libx264", "-pix_fmt", "yuv420p", str(base)], check=True)
+    sp = bn.normalize_spec({"path": str(bars), "start": 0.5}, cfg)
+    assert sp["chroma"] is True                                    # зелёный найден, несмотря на чёрные углы кадра
+    x0, y0, x1, y1 = bn.content_box(bars, sp["chroma_color"])
+    assert 0.27 < y0 < 0.32 and 0.68 < y1 < 0.73                     # рамка — только красная панель, без полос
+    out = tmp_path / "out.mp4"
+    bn.apply_banner(base, out, sp, cfg, log=lambda *_: None)
+    # на высоте бывших полос (над и под панелью) должен быть чистый фон клипа, не чёрный
+    for y in (662, 1258):
+        r = subprocess.run(["ffmpeg", "-v", "error", "-ss", "1.5", "-i", str(out), "-frames:v", "1", "-vf", f"crop=2:2:540:{y}",
+                            "-f", "rawvideo", "-pix_fmt", "rgb24", "-"], capture_output=True, check=True)
+        assert r.stdout[2] > 100, (y, tuple(r.stdout[:3]))

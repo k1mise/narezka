@@ -151,7 +151,8 @@ def _hex(rgb) -> str:
 
 
 def detect_key(path: str | Path) -> str | None:
-    """Цвет однотонного зелёного фона по углам кадра (#rrggbb) или None, если фон не зелёный/не однотонный."""
+    """Цвет однотонного зелёного фона (#rrggbb) по краям кадра или None, если фон не зелёный/не однотонный.
+    Почти чёрные пиксели (полосы леттербокса по краю кадра) не учитываются."""
     import numpy as np
     try:
         fr = _frames_of(path)
@@ -159,29 +160,41 @@ def detect_key(path: str | Path) -> str | None:
         return None
     if fr is None:
         return None
-    k = 8
-    corners = [fr[:, :k, :k], fr[:, :k, -k:], fr[:, -k:, :k], fr[:, -k:, -k:]]
-    cols = np.array([np.median(c.reshape(-1, 3), axis=0) for c in corners], dtype=float)
-    mid = np.median(cols, axis=0)
-    if np.max(np.linalg.norm(cols - mid, axis=1)) > 60:
-        return None     # углы разного цвета — фона нет
-    r, g, b = mid
-    return _hex(mid) if g >= 90 and g - r >= 40 and g - b >= 40 else None
+    m = int(GRID * 0.15)
+    ring = np.ones((GRID, GRID), dtype=bool)
+    ring[m:-m, m:-m] = False
+    px = fr[:: max(1, len(fr) // 4)][:, ring].reshape(-1, 3).astype(float)
+    px = px[px.max(axis=1) > 24]
+    if len(px) < 200:
+        return None
+    r, g, b = px[:, 0], px[:, 1], px[:, 2]
+    green = px[(g >= 90) & (g - r >= 40) & (g - b >= 40)]
+    if len(green) < 0.5 * len(px):
+        return None     # по краям не зелёный фон
+    mid = np.median(green, axis=0)
+    if np.percentile(np.linalg.norm(green - mid, axis=1), 80) > 50:
+        return None     # зелёный, но не однотонный (например, зелёная картинка)
+    return _hex(mid)
 
 
-def content_box(path: str | Path, key_hex: str, tol: float = 80.0) -> tuple[float, float, float, float] | None:
-    """Прямоугольник (x0, y0, x1, y1) в долях кадра, где есть что-то кроме фона key_hex (по всем кадрам). None — обрезать нечего."""
+def content_box(path: str | Path, key_hex: str, tol: float = 80.0, black: int = 24) -> tuple[float, float, float, float] | None:
+    """Прямоугольник (x0, y0, x1, y1) в долях кадра, где есть что-то кроме фона key_hex (по всем кадрам). None — обрезать нечего.
+    Почти чёрные пиксели тоже считаются фоном: у зелёных баннеров часто остаются чёрные полосы по краям кадра (леттербокс)."""
     import numpy as np
     fr = _frames_of(path)
     if fr is None:
         return None
     key = np.array([int(key_hex[i:i + 2], 16) for i in (1, 3, 5)], dtype=float)
     dist = np.linalg.norm(fr.astype(float) - key, axis=-1)
-    mask = (dist > tol).any(axis=0)
+    f = fr.astype(int)
+    r, g, b, mx = f[..., 0], f[..., 1], f[..., 2], f.max(axis=-1)
+    dark_green = (mx <= 90) & (g - r >= 20) & (g - b >= 20)    # переход «чёрная полоса → зелёный фон» после сжатия кадра
+    content = (dist > tol) & (mx > black) & ~dark_green
+    mask = content.any(axis=0)
     cols, rows = np.where(mask.sum(axis=0) >= 2)[0], np.where(mask.sum(axis=1) >= 2)[0]
     if not len(cols) or not len(rows):
         return None
-    pad = 0.015
+    pad = 0.006
     x0, x1 = max(cols[0] / GRID - pad, 0.0), min((cols[-1] + 1) / GRID + pad, 1.0)
     y0, y1 = max(rows[0] / GRID - pad, 0.0), min((rows[-1] + 1) / GRID + pad, 1.0)
     if x1 - x0 > 0.97 and y1 - y0 > 0.97:
