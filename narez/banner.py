@@ -150,9 +150,16 @@ def _hex(rgb) -> str:
     return "#{:02x}{:02x}{:02x}".format(*[int(round(v)) for v in rgb])
 
 
+def _greenish(f):
+    """Маска «зелёных» пикселей (g заметно больше r и b) для массива (..., 3) int."""
+    r, g, b = f[..., 0], f[..., 1], f[..., 2]
+    return (g >= 90) & (g - r >= 40) & (g - b >= 40)
+
+
 def detect_key(path: str | Path) -> str | None:
-    """Цвет однотонного зелёного фона (#rrggbb) по краям кадра или None, если фон не зелёный/не однотонный.
-    Почти чёрные пиксели (полосы леттербокса по краю кадра) не учитываются."""
+    """Цвет однотонного зелёного фона (#rrggbb) или None, если такого фона нет.
+    Условия: зелёного заметно много (≥5% кадра), он однотонный, и большая часть его лежит у краёв кадра (а не зелёная картинка в центре).
+    Фон может занимать только узкие полосы сверху/снизу — тёмная плашка баннера на весь кадр не мешает."""
     import numpy as np
     try:
         fr = _frames_of(path)
@@ -160,21 +167,30 @@ def detect_key(path: str | Path) -> str | None:
         return None
     if fr is None:
         return None
-    m = int(GRID * 0.15)
-    ring = np.ones((GRID, GRID), dtype=bool)
-    ring[m:-m, m:-m] = False
-    px = fr[:: max(1, len(fr) // 4)][:, ring].reshape(-1, 3).astype(float)
-    px = px[px.max(axis=1) > 24]
-    if len(px) < 200:
+    f = fr[:: max(1, len(fr) // 4)].astype(int)
+    gm = _greenish(f)
+    if gm.mean() < 0.05:
         return None
-    r, g, b = px[:, 0], px[:, 1], px[:, 2]
-    green = px[(g >= 90) & (g - r >= 40) & (g - b >= 40)]
-    if len(green) < 0.5 * len(px):
-        return None     # по краям не зелёный фон
+    m = int(GRID * 0.2)
+    edge = np.ones((GRID, GRID), dtype=bool)
+    edge[m:-m, m:-m] = False
+    if gm[:, edge].sum() < 0.5 * gm.sum():
+        return None
+    green = f[gm].astype(float)
     mid = np.median(green, axis=0)
     if np.percentile(np.linalg.norm(green - mid, axis=1), 80) > 50:
-        return None     # зелёный, но не однотонный (например, зелёная картинка)
+        return None     # зелёный, но не однотонный
     return _hex(mid)
+
+
+def key_for_filter(color: str) -> str:
+    """Цвет для ffmpeg chromakey. Он сравнивает только оттенок (U/V), а у тёмного зелёного (0,175,8) U/V ближе к нейтральному серому,
+    чем у яркого — из-за этого вместе с фоном вырезались бы тёмные части баннера. Поэтому доводим яркость до максимума (оттенок тот же)."""
+    rgb = [int(color[i:i + 2], 16) for i in (1, 3, 5)]
+    mx = max(rgb)
+    if mx <= 0:
+        return color
+    return _hex([min(255, v * 255 / mx) for v in rgb])
 
 
 def content_box(path: str | Path, key_hex: str, tol: float = 80.0, black: int = 24) -> tuple[float, float, float, float] | None:
@@ -185,11 +201,14 @@ def content_box(path: str | Path, key_hex: str, tol: float = 80.0, black: int = 
     if fr is None:
         return None
     key = np.array([int(key_hex[i:i + 2], 16) for i in (1, 3, 5)], dtype=float)
-    dist = np.linalg.norm(fr.astype(float) - key, axis=-1)
     f = fr.astype(int)
     r, g, b, mx = f[..., 0], f[..., 1], f[..., 2], f.max(axis=-1)
+    if key[1] >= 90 and key[1] - key[0] >= 40 and key[1] - key[2] >= 40:
+        is_bg = _greenish(f)                                   # зелёный фон: по оттенку, а не по яркости
+    else:
+        is_bg = np.linalg.norm(f - key, axis=-1) <= tol
     dark_green = (mx <= 90) & (g - r >= 20) & (g - b >= 20)    # переход «чёрная полоса → зелёный фон» после сжатия кадра
-    content = (dist > tol) & (mx > black) & ~dark_green
+    content = ~is_bg & (mx > black) & ~dark_green
     mask = content.any(axis=0)
     cols, rows = np.where(mask.sum(axis=0) >= 2)[0], np.where(mask.sum(axis=1) >= 2)[0]
     if not len(cols) or not len(rows):
@@ -238,7 +257,7 @@ def effective_info(spec: dict, info: dict, cfg: dict) -> dict:
 
 
 def chroma_filter(spec: dict, cfg: dict) -> str:
-    color = "0x" + (spec.get("chroma_color") or "#00ff00")[1:]
+    color = "0x" + key_for_filter(spec.get("chroma_color") or "#00ff00")[1:]
     bn = cfg["banner"]
     f = f"format=rgba,chromakey=color={color}:similarity={float(bn.get('chroma_similarity', 0.22)):.3f}:blend={float(bn.get('chroma_blend', 0.08)):.3f}"
     return f + ",despill=type=green,format=rgba"   # despill убирает зелёную кайму на краях объекта
@@ -274,7 +293,7 @@ def describe_info(spec: dict, cfg: dict) -> dict:
         text += " ✓" if ok else f" — МЕНЬШЕ {min_area}%: у баннера слишком вытянутая форма."
         if spec.get("chroma"):
             ei = effective_info(spec, info, cfg)
-            text += f". Фон {spec.get('chroma_color')} вырезан" + (f", видимая часть {ei['w']}×{ei['h']}" if ei["crop"] else "")
+            text = text.rstrip(".") + f". Фон {spec.get('chroma_color')} вырезан" + (f", видимая часть {ei['w']}×{ei['h']}" if ei["crop"] else "")
     return {"kind": info["kind"], "has_audio": info["has_audio"], "duration": info["duration"],
             "width": info["w"], "height": info["h"], "out_w": w, "out_h": h, "area_percent": round(frac * 100, 1), "ok": ok, "text": text}
 

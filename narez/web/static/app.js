@@ -381,7 +381,12 @@ async function buildEditor(root) {
   const ov = h("div", {class: "bn-ov"}); frame.append(ov);
   if (!document.getElementById("nz-key-svg")) {   // фильтр «зелёный → прозрачный» для живого предпросмотра (точный результат — в рендере)
     const wrap = document.createElement("div"); wrap.id = "nz-key-svg"; wrap.style.cssText = "position:absolute;width:0;height:0;overflow:hidden";
-    wrap.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" width="0" height="0"><filter id="nz-key" color-interpolation-filters="sRGB"><feColorMatrix type="matrix" values="1 0 0 0 0  0 1 0 0 0  0 0 1 0 0  3 -6 3 0 1"/></filter></svg>';
+    wrap.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" width="0" height="0"><filter id="nz-key" x="0" y="0" width="100%" height="100%" color-interpolation-filters="sRGB">'
+      + '<feColorMatrix in="SourceGraphic" type="matrix" values="-1 1 0 0 0  -1 1 0 0 0  -1 1 0 0 0  0 0 0 0 1" result="gr"/>'      // насколько зелёного больше, чем красного
+      + '<feColorMatrix in="SourceGraphic" type="matrix" values="0 1 -1 0 0  0 1 -1 0 0  0 1 -1 0 0  0 0 0 0 1" result="gb"/>'      // ... чем синего
+      + '<feComposite in="gr" in2="gb" operator="arithmetic" k1="1" k2="0" k3="0" k4="0" result="prod"/>'
+      + '<feColorMatrix in="prod" type="matrix" values="0 0 0 0 0  0 0 0 0 0  0 0 0 0 0  -4 0 0 0 1" result="mask"/>'                // зелёное → прозрачное
+      + '<feComposite in="SourceGraphic" in2="mask" operator="in"/></filter></svg>';
     document.body.append(wrap);
   }
   let live = true;   // живой предпросмотр: баннер рисуется поверх плеера (приблизительно); «точный» — настоящий рендер ffmpeg

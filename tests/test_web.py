@@ -694,3 +694,28 @@ def test_chroma_key_ignores_black_letterbox_bars(env, tmp_path):
         r = subprocess.run(["ffmpeg", "-v", "error", "-ss", "1.5", "-i", str(out), "-frames:v", "1", "-vf", f"crop=2:2:540:{y}",
                             "-f", "rawvideo", "-pix_fmt", "rgb24", "-"], capture_output=True, check=True)
         assert r.stdout[2] > 100, (y, tuple(r.stdout[:3]))
+
+
+@pytest.mark.skipif(not shutil.which("ffmpeg"), reason="нет ffmpeg")
+def test_chroma_key_dark_panel_with_thin_green_bands(env, tmp_path):
+    """Как реальный баннер: тёмная плашка почти на весь кадр, зелёный фон только узкими полосами сверху и снизу.
+    Фон должен найтись, а тёмная плашка — остаться непрозрачной (тёмные цвета нельзя вырезать вместе с зелёным)."""
+    from narez import banner as bn
+    c, cfg, db, _ = env
+    cfg["clips"]["preset"] = "ultrafast"
+    ban, base = tmp_path / "panel.mp4", tmp_path / "base.mp4"
+    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i", "color=c=0x00b008:s=1920x644:r=25:d=2",
+                    "-f", "lavfi", "-i", "color=c=0x16193a:s=1920x568:r=25:d=2", "-filter_complex",
+                    "[0][1]overlay=0:40[v]", "-map", "[v]", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(ban)], check=True)
+    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i", "color=c=0xc03030:s=1080x1920:r=25:d=3",
+                    "-c:v", "libx264", "-pix_fmt", "yuv420p", str(base)], check=True)
+    key = bn.detect_key(ban)
+    assert key and bn.key_for_filter(key)[1:3] == "00" and bn.key_for_filter(key)[3:5] == "ff"   # яркость доведена до максимума
+    sp = bn.normalize_spec({"path": str(ban), "start": 0.5}, cfg)
+    assert sp["chroma"] is True
+    out = tmp_path / "out.mp4"
+    bn.apply_banner(base, out, sp, cfg, log=lambda *_: None)
+    r = subprocess.run(["ffmpeg", "-v", "error", "-ss", "1.5", "-i", str(out), "-frames:v", "1", "-vf", "crop=2:2:540:960",
+                        "-f", "rawvideo", "-pix_fmt", "rgb24", "-"], capture_output=True, check=True)
+    px = tuple(r.stdout[:3])
+    assert px[0] < 80 and px[2] < 120, px          # плашка осталась тёмно-синей, а не стала красным фоном клипа
