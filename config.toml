@@ -60,3 +60,8 @@ max_height = 1080
 proxy = ""
 cookies_from_browser = ""
 cookies_file = "D:/narez/assets/cookies.txt"
+
+[history]
+sync_channel = true          # false — отключить подтягивание видео с канала
+sync_limit = 200             # сколько последних видео канала смотреть
+shorts_max_seconds = 180     # видео длиннее не считаются клипами

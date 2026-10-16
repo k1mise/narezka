@@ -61,6 +61,11 @@ class DB:
             for name, decl in cols.items():
                 if name not in have:
                     self.c.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+        # история группируется по группе КАНАЛА (аккаунта), а не по группе клипа на момент публикации: чиним старые записи
+        self.c.execute(
+            "UPDATE publications SET group_id=(SELECT a.group_id FROM accounts a WHERE a.id=publications.account_id) "
+            "WHERE account_id IN (SELECT id FROM accounts) "
+            "AND COALESCE(group_id,-1) != (SELECT a.group_id FROM accounts a WHERE a.id=publications.account_id)")
         self.c.commit()
 
     # --- группы и аккаунты ---
@@ -284,6 +289,9 @@ class DB:
     # --- публикации (история) ---
     def add_publication(self, clip_id: int, account_id: int, group_id: int | None, platform: str, url: str,
                         title: str, thumb: str = "", publish_at: str = "", uploaded_at: str | None = None) -> int:
+        acc = self.c.execute("SELECT group_id FROM accounts WHERE id=?", (account_id,)).fetchone()
+        if acc:   # видео принадлежит каналу, а клип мог быть перенесён в другую группу в редакторе: группа берётся у аккаунта
+            group_id = acc["group_id"]
         cur = self.c.execute(
             "INSERT INTO publications(clip_id,account_id,group_id,platform,video_id,url,title,thumb,publish_at,uploaded_at) "
             "VALUES(?,?,?,?,?,?,?,?,?,COALESCE(?, CURRENT_TIMESTAMP))",

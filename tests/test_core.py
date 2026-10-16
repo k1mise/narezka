@@ -564,3 +564,23 @@ def test_sync_channels_adds_missing_shorts_only(tmp_path):
 def test_iso_duration():
     from narez.publishers.youtube import iso_duration
     assert iso_duration("PT1M5S") == 65 and iso_duration("PT45S") == 45 and iso_duration("PT3M") == 180 and iso_duration("") == 0
+
+
+def test_publication_group_follows_account_not_clip(tmp_path):
+    db = make_db(tmp_path)
+    g1, g2 = db.add_group("Тест"), db.add_group("Тест 2")
+    db.set_account(g1, "youtube", "Экономика"); db.set_account(g2, "youtube", "Другой")
+    a1 = db.accounts(g1)[0]["id"]
+    # клип группы «Тест 2» ушёл на канал группы «Тест» (группу клипа сменили в редакторе): в истории он — группы канала
+    pid = db.add_publication(None, a1, g2, "youtube", "https://youtube.com/shorts/AAAAAAAAAAA", "t")
+    assert db.publication(pid)["group_id"] == g1
+    # старая запись с «чужой» группой чинится при открытии базы
+    db.c.execute("UPDATE publications SET group_id=? WHERE id=?", (g2, pid)); db.c.commit()
+    db.c.execute("INSERT INTO publications(account_id,group_id,platform,video_id,url,title) VALUES(999,?,?,?,?,?)", (g2, "youtube", "x", "u", "t"))  # аккаунта нет — не трогаем
+    db.c.commit()
+    from narez.db import DB
+    db2 = DB(tmp_path / "t.db") if (tmp_path / "t.db").exists() else None
+    if db2 is None:
+        db._migrate(); db2 = db
+    rows = {r["account_id"]: r["group_id"] for r in db2.c.execute("SELECT account_id, group_id FROM publications")}
+    assert rows[a1] == g1 and rows[999] == g2
