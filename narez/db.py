@@ -21,6 +21,7 @@ CREATE TABLE IF NOT EXISTS clips(
   path TEXT, start REAL, end REAL, title TEXT, reason TEXT, score REAL,
   status TEXT DEFAULT 'ready');
 CREATE TABLE IF NOT EXISTS presets(id INTEGER PRIMARY KEY, name TEXT UNIQUE NOT NULL, data TEXT DEFAULT '{}');
+CREATE TABLE IF NOT EXISTS templates(id INTEGER PRIMARY KEY, name TEXT UNIQUE NOT NULL, data TEXT DEFAULT '{}');
 CREATE TABLE IF NOT EXISTS proxies(
   id INTEGER PRIMARY KEY, url TEXT UNIQUE NOT NULL, status TEXT DEFAULT 'new', ip TEXT DEFAULT '', country TEXT DEFAULT '',
   code TEXT DEFAULT '', city TEXT DEFAULT '', isp TEXT DEFAULT '', ms INTEGER DEFAULT 0, error TEXT DEFAULT '',
@@ -149,6 +150,14 @@ class DB:
         self.c.commit()
         return cur.lastrowid
 
+    def copy_clip(self, clip_id: int, path: str, thumb: str, group_id: int) -> int:
+        """Копия клипа (того же задания) в другую группу: свой файл и превью, баннер и описание те же."""
+        cur = self.c.execute(
+            "INSERT INTO clips(job_id,path,start,end,title,reason,score,tags,banner,thumb,group_id) "
+            "SELECT job_id,?,start,end,title,reason,score,tags,banner,?,? FROM clips WHERE id=?", (path, thumb, group_id, clip_id))
+        self.c.commit()
+        return cur.lastrowid
+
     def clips(self, job_id: int):
         return self.c.execute("SELECT * FROM clips WHERE job_id=? ORDER BY start", (job_id,)).fetchall()
 
@@ -220,6 +229,28 @@ class DB:
 
     def delete_proxies(self, ids: list[int]):
         self.c.executemany("DELETE FROM proxies WHERE id=?", [(i,) for i in ids])
+        self.c.commit()
+
+    # --- шаблоны публикации: набор «группа + пресет баннеров» ---
+    def templates(self):
+        return self.c.execute("SELECT * FROM templates ORDER BY name COLLATE NOCASE").fetchall()
+
+    def template(self, tpl_id: int):
+        return self.c.execute("SELECT * FROM templates WHERE id=?", (tpl_id,)).fetchone()
+
+    def save_template(self, name: str, data: dict, tpl_id: int | None = None) -> int:
+        """tpl_id задан — переименование/правка существующего, иначе создание (имя уникально)."""
+        raw = json.dumps(data, ensure_ascii=False)
+        if tpl_id:
+            self.c.execute("UPDATE templates SET name=?, data=? WHERE id=?", (name, raw, tpl_id))
+            self.c.commit()
+            return tpl_id
+        cur = self.c.execute("INSERT INTO templates(name,data) VALUES(?,?)", (name, raw))
+        self.c.commit()
+        return cur.lastrowid
+
+    def delete_template(self, tpl_id: int):
+        self.c.execute("DELETE FROM templates WHERE id=?", (tpl_id,))
         self.c.commit()
 
     # --- пресеты редактирования ---

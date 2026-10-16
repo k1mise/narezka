@@ -67,6 +67,7 @@ def test_instagram_error_message(env, monkeypatch, tmp_path):
 def test_tiktok_chunks_and_privacy(env, monkeypatch, tmp_path):
     c, cfg, db, app = env
     from narez.publishers import tiktok as tt
+    cfg.setdefault("tiktok", {})["mode"] = "direct"
     pub = tt.TikTokPublisher(cfg)
     pub.token_path(3).write_text(json.dumps({"access_token": "AT", "refresh_token": "R", "username": "me",
                                              "expires_at": time.time() + 9999}))
@@ -94,6 +95,34 @@ def test_tiktok_chunks_and_privacy(env, monkeypatch, tmp_path):
     n = 25 * 1024 * 1024
     assert init_body["source_info"]["total_chunk_count"] == 2
     assert ranges == [f"bytes 0-{10 * 1024 * 1024 - 1}/{n}", f"bytes {10 * 1024 * 1024}-{n - 1}/{n}"]
+
+
+def test_tiktok_inbox_default(env, monkeypatch, tmp_path):
+    c, cfg, db, app = env
+    from narez.publishers import tiktok as tt
+    pub = tt.TikTokPublisher(cfg)
+    assert pub.mode() == "inbox"
+    pub.token_path(4).write_text(json.dumps({"access_token": "AT", "refresh_token": "R", "username": "me", "expires_at": time.time() + 9999}))
+    v = tmp_path / "v.mp4"; v.write_bytes(b"a" * 1000)
+    urls, bodies = [], []
+
+    def post(url, headers=None, data=None, **k):
+        urls.append(url)
+        if "inbox/video/init" in url:
+            bodies.append(json.loads(data))
+            return Resp({"data": {"publish_id": "P9", "upload_url": "https://up.example/y"}, "error": {"code": "ok"}})
+        return Resp({"data": {"status": "SEND_TO_USER_INBOX"}, "error": {"code": "ok"}})
+    monkeypatch.setattr(tt.requests, "post", post)
+    monkeypatch.setattr(tt.requests, "put", lambda *a, **k: Resp({}, 201))
+    url = pub.publish(str(v), "T", "", {"account_id": 4})
+    assert url.endswith("#draft-P9")
+    assert not any("creator_info" in u or "publish/video/init/" in u for u in urls)  # Direct Post не трогаем
+    assert "post_info" not in bodies[0] and bodies[0]["source_info"]["total_chunk_count"] == 1
+
+
+def test_tiktok_draft_status():
+    from narez.service import pub_status
+    assert pub_status({"privacy": "draft", "publish_at": ""}) == "В черновиках TikTok"
 
 
 def test_tiktok_error_hint():
@@ -133,7 +162,7 @@ def test_future_clip_goes_to_queue_and_runs_when_due(env, monkeypatch):
     assert service.run_due(DB(cfg["paths"]["db"]), cfg) == 1 and sent == [None]
     assert c.get("/api/scheduled").json() == []
     h = c.get("/api/history").json()
-    assert len(h) == 1 and h[0]["platform"] == "tiktok" and h[0]["status"] == "Опубликовано"
+    assert len(h) == 1 and h[0]["platform"] == "tiktok" and h[0]["status"] == "В черновиках TikTok"
     assert c.get(f"/api/groups/{g}/clips").json() == []
 
 

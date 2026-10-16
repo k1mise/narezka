@@ -30,9 +30,18 @@ def send_one(db, cfg: dict, a: dict, clip, when, log=print) -> str:
     if real:
         pid = db.add_publication(clip["id"], a["id"], db.clip_group(clip), a["platform"], url,
                                  clip["title"], clip["thumb"], schedule.to_iso(when) if when else "")
-        if a["platform"] != "youtube":  # статистики по ним пока нет — отметим, что видео уже выложено
-            tiktok_private = a["platform"] == "tiktok" and cfg.get("tiktok", {}).get("privacy", "PUBLIC_TO_EVERYONE") != "PUBLIC_TO_EVERYONE"
-            db.update_stats(pid, None, None, None, "private" if tiktok_private else "public")
+        if a["platform"] == "youtube":  # сразу известны статус и нулевая статистика; реальные цифры подтянет обновление статистики
+            db.update_stats(pid, 0, 0, 0, "private" if when else cfg["youtube"].get("privacy", "private"),
+                            schedule.to_iso(when) if when else None)
+        else:  # статистики по ним пока нет — отметим, что видео уже выложено
+            tt = cfg.get("tiktok", {})
+            if a["platform"] == "tiktok" and str(tt.get("mode", "inbox")).lower() != "direct":
+                state = "draft"  # лежит в черновиках TikTok: публикует сам пользователь
+            elif a["platform"] == "tiktok" and tt.get("privacy", "PUBLIC_TO_EVERYONE") != "PUBLIC_TO_EVERYONE":
+                state = "private"
+            else:
+                state = "public"
+            db.update_stats(pid, None, None, None, state)
     return url
 
 
@@ -119,6 +128,8 @@ def pub_status(p) -> str:
     priv, at = p["privacy"] or "", schedule.from_iso(p["publish_at"] or "")
     if priv == "deleted":
         return "Удалено"
+    if priv == "draft":
+        return "В черновиках TikTok"
     if priv == "public":
         return "Опубликовано"
     if priv == "unlisted":

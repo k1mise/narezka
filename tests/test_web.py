@@ -933,3 +933,80 @@ def test_publish_batch_all_at_once_ignores_config_delay(env, monkeypatch):
     monkeypatch.setattr(service, "get_publisher", lambda *a, **k: Fake())
     t = c.post("/api/publish/batch", json={"clip_ids": ids, "interval_minutes": 0}).json()
     assert wait_task(c, t)["result"]["published"] == 3 and sent == [None, None, None]
+
+
+def test_history_shows_status_and_zero_stats_right_after_upload(env, monkeypatch):
+    c, cfg, db, _ = env
+    from narez import service
+    from narez.publishers.base import Publisher
+    g = db.add_group("A"); db.set_account(g, "youtube", "main")
+    ids = [add_clip(db, cfg, g, f"К{i}", i) for i in range(2)]
+
+    class Fake(Publisher):
+        platform = "youtube"
+
+        def publish(self, path, title, desc, cred, when=None, tags=None):
+            return f"https://youtube.com/shorts/{title[-1] * 11}"
+    monkeypatch.setattr(service, "get_publisher", lambda *a, **k: Fake())
+    t = c.post("/api/publish/batch", json={"clip_ids": ids, "interval_minutes": 60, "privacy": "public"}).json()
+    assert wait_task(c, t)["result"]["published"] == 2
+    h = {x["title"]: x for x in c.get("/api/history").json()}
+    assert h["К0"]["status"] == "Опубликовано" and h["К0"]["views"] == 0       # первый вышел сразу и публично, цифры не «—»
+    assert h["К1"]["status"].startswith("Запланировано") and h["К1"]["views"] == 0
+
+
+def test_templates_crud_validation(env):
+    c, cfg, db, _ = env
+    g1, g2 = db.add_group("A"), db.add_group("B")
+    pr = c.post("/api/presets", json={"name": "Теги", "tags": "x"}).json()
+    body = {"name": "Собаки", "items": [{"group_id": g1, "preset_id": pr["id"]}, {"group_id": g2}]}
+    assert c.post("/api/templates", json={**body, "name": " "}).status_code == 400
+    assert c.post("/api/templates", json={**body, "items": []}).status_code == 400
+    assert c.post("/api/templates", json={**body, "items": [{"group_id": g1}, {"group_id": g1}]}).status_code == 400
+    assert c.post("/api/templates", json={**body, "items": [{"group_id": 99}]}).status_code == 404
+    assert c.post("/api/templates", json={**body, "items": [{"group_id": g1, "preset_id": 99}]}).status_code == 400
+    t = c.post("/api/templates", json=body).json()
+    assert [i["group"] for i in t["items"]] == ["A", "B"] and t["items"][0]["preset"] == "Теги" and not t["broken"]
+    assert c.post("/api/templates", json=body).status_code == 400            # то же имя
+    t2 = c.post("/api/templates", json={"id": t["id"], "name": "Собаки 2", "items": [{"group_id": g2}]}).json()
+    assert t2["id"] == t["id"] and t2["name"] == "Собаки 2" and len(t2["items"]) == 1
+    c.delete(f"/api/presets/{pr['id']}")
+    assert c.get("/api/templates").json()[0]["broken"] is False               # в шаблоне уже нет этого пресета
+    assert c.delete(f"/api/templates/{t['id']}").status_code == 200
+    assert c.get("/api/templates").json() == [] and c.delete(f"/api/templates/{t['id']}").status_code == 404
+
+
+def test_process_with_template_fans_out_clips(env, monkeypatch):
+    c, cfg, db, _ = env
+    g1, g2, g3 = db.add_group("A"), db.add_group("B"), db.add_group("C")
+    p1 = c.post("/api/presets", json={"name": "П1", "tags": "один", "footer": "Футер 1"}).json()
+    p2 = c.post("/api/presets", json={"name": "П2", "tags": "два"}).json()
+    tpl = c.post("/api/templates", json={"name": "Т", "items": [{"group_id": g2, "preset_id": p1["id"]}, {"group_id": g3, "preset_id": p2["id"]}]}).json()
+    assert c.post("/api/process", json={"url": "https://x.y/v", "template_id": 999}).status_code == 404
+
+    def fake(url, cfg_, db_, gid, log, **k):
+        j = db_.add_job(gid, url, "Исходник")
+        for i in range(2):
+            pth = cfg["paths"]["workdir"] / "clips" / f"j{j}_{i}.mp4"
+            pth.parent.mkdir(exist_ok=True); pth.write_bytes(b"clip")
+            db_.add_clip(j, str(pth), Moment(0, 40, f"К{i}", "Описание", 5), tags="#a")
+        return j, db_.clips(j)
+    monkeypatch.setattr("narez.web.server.run_pipeline", fake)
+    r = wait_task(c, c.post("/api/process", json={"url": "https://x.y/v", "template_id": tpl["id"], "group_id": g1}).json())
+    assert r["status"] == "done" and r["result"]["clips"] == 4
+    by = {g: [x for x in c.get("/api/clips").json() if x["group_id"] == g] for g in (g1, g2, g3)}
+    assert by[g1] == [] and len(by[g2]) == 2 and len(by[g3]) == 2
+    assert "#один" in by[g2][0]["tags"] and "Футер 1" in by[g2][0]["description"]
+    assert "#два" in by[g3][0]["tags"] and "#один" not in by[g3][0]["tags"] and "Футер" not in by[g3][0]["description"]
+    paths = {db.clip(x["id"])["path"] for g in (g2, g3) for x in by[g]}
+    assert len(paths) == 4 and all(Path(p).exists() for p in paths)           # у каждой копии свой файл
+
+
+def test_history_has_group_id(env):
+    c, cfg, db, _ = env
+    g = db.add_group("A"); db.set_account(g, "youtube", "yt")
+    a = db.accounts(g)[0]["id"]
+    cid = add_clip(db, cfg, g)
+    db.add_publication(cid, a, g, "youtube", "https://youtu.be/x", "T")
+    h = c.get("/api/history").json()
+    assert h[0]["group_id"] == g and h[0]["group"] == "A"

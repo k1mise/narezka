@@ -1,6 +1,8 @@
-"""Публикация в TikTok через Content Posting API (Direct Post, загрузка файла кусками).
+"""Публикация в TikTok через Content Posting API (загрузка файла кусками).
 
-Важно: пока приложение не прошло аудит TikTok, все видео выкладываются только как «Только я» (SELF_ONLY).
+Два режима (`[tiktok] mode`): «inbox» (по умолчанию) — видео уходит в черновики приложения TikTok, а публикует/планирует его
+сам пользователь (нужен только scope video.upload); «direct» — Direct Post сразу в ленту (нужен аудит приложения,
+до него — только «Только я» и закрытый аккаунт).
 Отложенной публикации у API нет: время держит narez (см. service.run_due)."""
 from __future__ import annotations
 
@@ -56,6 +58,9 @@ class TikTokPublisher(Publisher):
 
     def client_secret(self) -> str:
         return os.environ.get("TIKTOK_CLIENT_SECRET") or str(self.tt.get("client_secret", ""))
+
+    def mode(self) -> str:
+        return "direct" if str(self.tt.get("mode", "inbox")).lower() == "direct" else "inbox"
 
     def redirect_port(self) -> int:
         return int(self.tt.get("redirect_port", 8766))
@@ -121,23 +126,12 @@ class TikTokPublisher(Publisher):
         return d["access_token"], d
 
     # --- публикация ---
-    def publish(self, video_path, title, description, credentials, publish_at=None, tags=None) -> str:
-        token, d = self._access(credentials["account_id"])
-        H = {"Authorization": f"Bearer {token}", "Content-Type": "application/json; charset=UTF-8"}
-        info = _check(requests.post(f"{API}/v2/post/publish/creator_info/query/", headers=H, timeout=30)).get("data", {})
-        options = info.get("privacy_level_options") or ["SELF_ONLY"]
-        want = str(self.tt.get("privacy", "PUBLIC_TO_EVERYONE"))
-        privacy = want if want in options else ("SELF_ONLY" if "SELF_ONLY" in options else options[0])
-        caption = (title.strip() + (" " + " ".join("#" + t for t in tags) if tags else ""))[:2200]
+    def _upload(self, H: dict, init_url: str, body: dict, video_path: str) -> str:
         size = os.path.getsize(video_path)
         chunk = size if size < 5 * 1024 * 1024 else CHUNK
         total = max(1, size // chunk)  # последний кусок забирает остаток
-        body = {"post_info": {"title": caption, "privacy_level": privacy,
-                              "disable_duet": bool(self.tt.get("disable_duet", False)),
-                              "disable_comment": bool(self.tt.get("disable_comment", False)),
-                              "disable_stitch": bool(self.tt.get("disable_stitch", False))},
-                "source_info": {"source": "FILE_UPLOAD", "video_size": size, "chunk_size": chunk, "total_chunk_count": total}}
-        init = _check(requests.post(f"{API}/v2/post/publish/video/init/", headers=H, data=json.dumps(body), timeout=60))["data"]
+        body["source_info"] = {"source": "FILE_UPLOAD", "video_size": size, "chunk_size": chunk, "total_chunk_count": total}
+        init = _check(requests.post(init_url, headers=H, data=json.dumps(body), timeout=60))["data"]
         pid, up = init["publish_id"], init["upload_url"]
         with open(video_path, "rb") as f:
             for i in range(total):
@@ -149,14 +143,38 @@ class TikTokPublisher(Publisher):
                     "Content-Type": "video/mp4", "Content-Length": str(len(data)), "Content-Range": f"bytes {start}-{end}/{size}"})
                 if r.status_code not in (200, 201, 206):
                     raise TikTokError(f"TikTok не принял кусок {i + 1}/{total}: HTTP {r.status_code} {r.text[:150]}")
+        return pid
+
+    def _wait(self, H: dict, pid: str, done: tuple) -> dict:
         for _ in range(60):
             s = _check(requests.post(f"{API}/v2/post/publish/status/fetch/", headers=H, data=json.dumps({"publish_id": pid}), timeout=30)).get("data", {})
             st = s.get("status")
-            if st == "PUBLISH_COMPLETE":
-                ids = s.get("publicaly_available_post_id") or s.get("publicly_available_post_id") or []
-                user = d.get("username") or d.get("open_id", "")
-                return f"https://www.tiktok.com/@{user}/video/{ids[0]}" if ids else f"https://www.tiktok.com/@{user}#{pid}"
+            if st in done:
+                return s
             if st == "FAILED":
                 raise TikTokError(f"TikTok отклонил видео: {s.get('fail_reason', 'без причины')}")
             time.sleep(5)
-        raise TikTokError("TikTok слишком долго обрабатывает видео. Проверь профиль позже — оно могло опубликоваться.")
+        raise TikTokError("TikTok слишком долго обрабатывает видео. Проверь черновики/профиль позже — оно могло дойти.")
+
+    def publish(self, video_path, title, description, credentials, publish_at=None, tags=None) -> str:
+        token, d = self._access(credentials["account_id"])
+        H = {"Authorization": f"Bearer {token}", "Content-Type": "application/json; charset=UTF-8"}
+        user = d.get("username") or d.get("open_id", "")
+        if self.mode() == "inbox":
+            # черновики: подпись и параметры API не принимает — их задаёт пользователь в приложении TikTok
+            pid = self._upload(H, f"{API}/v2/post/publish/inbox/video/init/", {}, video_path)
+            self._wait(H, pid, ("SEND_TO_USER_INBOX", "PUBLISH_COMPLETE"))
+            return f"https://www.tiktok.com/@{user}#draft-{pid}"
+        info = _check(requests.post(f"{API}/v2/post/publish/creator_info/query/", headers=H, timeout=30)).get("data", {})
+        options = info.get("privacy_level_options") or ["SELF_ONLY"]
+        want = str(self.tt.get("privacy", "PUBLIC_TO_EVERYONE"))
+        privacy = want if want in options else ("SELF_ONLY" if "SELF_ONLY" in options else options[0])
+        caption = (title.strip() + (" " + " ".join("#" + t for t in tags) if tags else ""))[:2200]
+        body = {"post_info": {"title": caption, "privacy_level": privacy,
+                              "disable_duet": bool(self.tt.get("disable_duet", False)),
+                              "disable_comment": bool(self.tt.get("disable_comment", False)),
+                              "disable_stitch": bool(self.tt.get("disable_stitch", False))}}
+        pid = self._upload(H, f"{API}/v2/post/publish/video/init/", body, video_path)
+        s = self._wait(H, pid, ("PUBLISH_COMPLETE",))
+        ids = s.get("publicaly_available_post_id") or s.get("publicly_available_post_id") or []
+        return f"https://www.tiktok.com/@{user}/video/{ids[0]}" if ids else f"https://www.tiktok.com/@{user}#{pid}"

@@ -118,8 +118,14 @@ TikTok Content Posting API, Instagram Graph API, VK API; планировщик 
 Лимит API — 100 публикаций за 24 часа на аккаунт. Видео: Reels до 90 секунд, вертикальное.
 
 ### TikTok (Content Posting API)
+**Режим по умолчанию — «черновики» (`mode = "inbox"`)**: narez загружает клип в черновики приложения TikTok (права `video.upload`),
+а публикуешь его ты сам: в приложении TikTok (уведомление «Видео готово к редактированию») либо, чтобы отложить, — в TikTok Studio
+(веб, нужен аккаунт Creator/Business, до 10 дней вперёд). API черновиков не принимает подпись, обложку и настройки — их задаёшь
+при публикации; название и описание клипа сохраняются в истории narez. В истории такие клипы помечены «В черновиках TikTok».
+Режим прямой публикации: `[tiktok] mode = "direct"` (требует аудита приложения TikTok).
+
 1. https://developers.tiktok.com → Manage apps → создать приложение; добавить продукты **Login Kit** и **Content Posting API**
-   (включи Direct Post), права `user.info.basic`, `video.publish`, `video.upload`.
+   (для режима direct включи Direct Post), права `user.info.basic`, `video.upload` (и `video.publish` для direct).
 2. **Redirect URI**: `http://localhost:8766/callback/` (порт — `[tiktok] redirect_port` в `config.toml`).
 3. **Client key** и **Client secret** → `.env` (`TIKTOK_CLIENT_KEY`, `TIKTOK_CLIENT_SECRET`).
 4. Пока приложение не прошло аудит TikTok, все видео публикуются только как «Только я» (SELF_ONLY), а аккаунт должен быть
@@ -135,6 +141,7 @@ graph_version = "v23.0"
 redirect_port = 8765
 
 [tiktok]
+mode = "inbox"                   # inbox — в черновики TikTok (по умолчанию) / direct — сразу в ленту (нужен аудит)
 privacy = "PUBLIC_TO_EVERYONE"   # PUBLIC_TO_EVERYONE / MUTUAL_FOLLOW_FRIENDS / FOLLOWER_OF_CREATOR / SELF_ONLY
 redirect_port = 8766
 disable_comment = false

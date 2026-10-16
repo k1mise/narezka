@@ -81,8 +81,9 @@ def cut_args(b: CutIn) -> dict:
 
 class ProcessIn(CutIn):
     url: str
-    group_id: int
+    group_id: int = 0
     test: bool = False
+    template_id: Optional[int] = None   # шаблон: клипы уходят во все его группы, каждая со своим пресетом баннеров
 
 
 class ProxyAddIn(BaseModel):
@@ -115,8 +116,20 @@ class RenameIn(BaseModel):
 class FileIn(CutIn):
     folder: str
     name: str
-    group_id: int
+    group_id: int = 0
     test: bool = False
+    template_id: Optional[int] = None
+
+
+class TemplateItemIn(BaseModel):
+    group_id: int
+    preset_id: Optional[int] = None
+
+
+class TemplateIn(BaseModel):
+    id: Optional[int] = None
+    name: str
+    items: list[TemplateItemIn]
 
 
 class ClipPatch(BaseModel):
@@ -422,7 +435,7 @@ def create_app(cfg: dict | None = None) -> FastAPI:
     # ---------- нарезка ----------
     @app.post("/api/process")
     def process(body: ProcessIn, d: DB = Depends(get_db)):
-        need_group(d, body.group_id)
+        gid, plan = resolve_target(d, body.group_id, body.template_id)
         try:
             url = normalize_source(body.url)
         except SourceError as e:
@@ -432,8 +445,9 @@ def create_app(cfg: dict | None = None) -> FastAPI:
 
         def fn(log):
             db2 = DB(cfg["paths"]["db"], init=False)
-            job_id, clips = run_pipeline(url, eff_cfg(db2, log), db2, body.group_id, log, test=body.test, **cut)
-            return {"job_id": job_id, "clips": len(clips)}
+            job_id, clips = run_pipeline(url, eff_cfg(db2, log), db2, gid, log, test=body.test, **cut)
+            fan_out(db2, job_id, plan, log)
+            return {"job_id": job_id, "clips": len(clips) * max(1, len(plan))}
         return started("process", f"{'Тест: ' if body.test else 'Нарезка целиком: ' if body.mode == 'full' else 'Нарезка: '}{Path(url).name if not url.startswith('http') else url}", fn, exclusive=True)
 
     @app.get("/api/tasks")
@@ -633,22 +647,19 @@ def create_app(cfg: dict | None = None) -> FastAPI:
         d.delete_preset(preset_id)
         return {"ok": True}
 
-    @app.post("/api/presets/{preset_id}/apply")
-    def apply_preset(preset_id: int, body: ApplyIn, d: DB = Depends(get_db)):
-        """Баннер заменяется, теги добавляются к имеющимся, текст дописывается в конец описания (один раз)."""
-        r = d.preset(preset_id)
-        if not r:
-            raise HTTPException(404, "Пресет не найден")
-        pr = preset_json(r)
-        banner_spec = None
-        if pr["banners"]:
-            lib = library()
-            for sp in pr["banners"]:
-                if sp["name"] not in lib:
-                    raise HTTPException(400, f"Файл баннера «{sp['name']}» из пресета удалён — сохрани пресет заново")
-            banner_spec = bn.specs_to_json([bn.normalize_spec({**sp, "path": str(lib[sp["name"]])}, cfg) for sp in pr["banners"]])
-        out = []
-        for cid in body.clip_ids:
+    def preset_banner_spec(pr: dict) -> str | None:
+        """JSON баннеров пресета для клипа; ValueError — если файла баннера уже нет в библиотеке."""
+        if not pr["banners"]:
+            return None
+        lib = library()
+        for sp in pr["banners"]:
+            if sp["name"] not in lib:
+                raise ValueError(f"Файл баннера «{sp['name']}» из пресета «{pr['name']}» удалён — сохрани пресет заново")
+        return bn.specs_to_json([bn.normalize_spec({**sp, "path": str(lib[sp["name"]])}, cfg) for sp in pr["banners"]])
+
+    def apply_preset_to(d: DB, pr: dict, banner_spec: str | None, clip_ids: list[int]) -> list[int]:
+        done = []
+        for cid in clip_ids:
             c = d.clip(cid)
             if not c or c["status"] != "ready":
                 continue
@@ -661,8 +672,121 @@ def create_app(cfg: dict | None = None) -> FastAPI:
                 upd["reason"] = ((c["reason"] or "").rstrip() + "\n\n" + pr["footer"]).strip()
             if upd:
                 d.update_clip(cid, **upd)
-            out.append(clip_json(d.clip(cid), d))
-        return out
+            done.append(cid)
+        return done
+
+    @app.post("/api/presets/{preset_id}/apply")
+    def apply_preset(preset_id: int, body: ApplyIn, d: DB = Depends(get_db)):
+        """Баннер заменяется, теги добавляются к имеющимся, текст дописывается в конец описания (один раз)."""
+        r = d.preset(preset_id)
+        if not r:
+            raise HTTPException(404, "Пресет не найден")
+        pr = preset_json(r)
+        try:
+            spec = preset_banner_spec(pr)
+        except ValueError as e:
+            raise HTTPException(400, str(e)) from None
+        return [clip_json(d.clip(cid), d) for cid in apply_preset_to(d, pr, spec, body.clip_ids)]
+
+    # ---------- шаблоны публикации ----------
+    def template_json(r, d: DB) -> dict:
+        items = []
+        for it in json.loads(r["data"] or "{}").get("items", []):
+            g = d.group(it["group_id"])
+            pr = d.preset(it["preset_id"]) if it.get("preset_id") else None
+            items.append({"group_id": it["group_id"], "group": g["name"] if g else "", "preset_id": it.get("preset_id"),
+                          "preset": pr["name"] if pr else "", "broken": not g or (bool(it.get("preset_id")) and not pr)})
+        return {"id": r["id"], "name": r["name"], "items": items, "broken": any(i["broken"] for i in items)}
+
+    @app.get("/api/templates")
+    def templates(d: DB = Depends(get_db)):
+        return [template_json(r, d) for r in d.templates()]
+
+    @app.post("/api/templates")
+    def save_template(body: TemplateIn, d: DB = Depends(get_db)):
+        name = body.name.strip()
+        if not name:
+            raise HTTPException(400, "Дай шаблону название")
+        if not body.items:
+            raise HTTPException(400, "Добавь в шаблон хотя бы одну группу")
+        seen = set()
+        for it in body.items:
+            need_group(d, it.group_id)
+            if it.group_id in seen:
+                raise HTTPException(400, "Одна группа указана в шаблоне дважды")
+            seen.add(it.group_id)
+            if it.preset_id and not d.preset(it.preset_id):
+                raise HTTPException(400, "Пресет баннеров не найден — выбери другой")
+        if body.id and not d.template(body.id):
+            raise HTTPException(404, "Шаблон не найден")
+        other = next((t for t in d.templates() if t["name"].lower() == name.lower() and t["id"] != body.id), None)
+        if other:
+            raise HTTPException(400, f"Шаблон «{name}» уже есть")
+        tid = d.save_template(name, {"items": [{"group_id": i.group_id, "preset_id": i.preset_id or None} for i in body.items]}, body.id)
+        return template_json(d.template(tid), d)
+
+    @app.delete("/api/templates/{tpl_id}")
+    def del_template(tpl_id: int, d: DB = Depends(get_db)):
+        if not d.template(tpl_id):
+            raise HTTPException(404, "Шаблон не найден")
+        d.delete_template(tpl_id)
+        return {"ok": True}
+
+    def resolve_target(d: DB, group_id: int, template_id: int | None):
+        """(группа задания, план по группам [(group_id, пресет|None, banner_spec)]). Без шаблона план пуст."""
+        if not template_id:
+            need_group(d, group_id)
+            return group_id, []
+        r = d.template(template_id)
+        if not r:
+            raise HTTPException(404, "Шаблон не найден")
+        plan = []
+        for it in json.loads(r["data"] or "{}").get("items", []):
+            if not d.group(it["group_id"]):
+                raise HTTPException(400, "В шаблоне есть удалённая группа — отредактируй шаблон")
+            pr = None
+            if it.get("preset_id"):
+                pre = d.preset(it["preset_id"])
+                if not pre:
+                    raise HTTPException(400, "В шаблоне есть удалённый пресет баннеров — отредактируй шаблон")
+                pr = preset_json(pre)
+                try:
+                    preset_banner_spec(pr)
+                except ValueError as e:
+                    raise HTTPException(400, str(e)) from None
+            plan.append((it["group_id"], pr))
+        if not plan:
+            raise HTTPException(400, "Шаблон пуст")
+        return plan[0][0], plan
+
+    def fan_out(d: DB, job_id: int, plan: list, log=print):
+        """Клипы задания копируются в остальные группы шаблона; каждой группе — её пресет баннеров (баннер, теги, подпись)."""
+        if not plan:
+            return
+        base = [c["id"] for c in d.clips(job_id)]
+        by_group = {plan[0][0]: list(base)}
+        for gid, _ in plan[1:]:
+            ids = []
+            for cid in base:
+                c = d.clip(cid)
+                src, th = Path(c["path"]), Path(c["thumb"]) if c["thumb"] else None
+                dst = src.with_name(f"{src.stem}_g{gid}{src.suffix}")
+                shutil.copy2(src, dst)
+                tdst = ""
+                if th and th.exists():
+                    t2 = th.with_name(f"{th.stem}_g{gid}{th.suffix}")
+                    shutil.copy2(th, t2)
+                    tdst = str(t2)
+                ids.append(d.copy_clip(cid, str(dst), tdst, gid))
+            by_group[gid] = ids
+        for gid, pr in plan:
+            ids = by_group[gid]
+            for cid in ids:
+                d.update_clip(cid, group_id=gid)
+            g = d.group(gid)
+            if pr:
+                apply_preset_to(d, pr, preset_banner_spec(pr), ids)
+            log(f"Группа «{g['name']}»: {len(ids)} клип(ов)" + (f", пресет «{pr['name']}»" if pr else ""))
 
     # ---------- папки и файлы ----------
     VIDEO_EXT = {".mp4", ".mkv", ".mov", ".webm", ".m4v", ".avi", ".flv", ".ts", ".mpg", ".mpeg", ".wmv"}
@@ -775,14 +899,15 @@ def create_app(cfg: dict | None = None) -> FastAPI:
     @app.post("/api/files/slice")
     def file_slice(body: FileIn, d: DB = Depends(get_db)):
         """Нарезать клипы из видеофайла, лежащего в папке исходников или тестов."""
-        need_group(d, body.group_id)
+        gid, plan = resolve_target(d, body.group_id, body.template_id)
         src = safe_file(body.folder, body.name)
         cut = cut_args(body)
 
         def fn(log):
             db2 = DB(cfg["paths"]["db"], init=False)
-            job_id, clips_ = run_pipeline(str(src), eff_cfg(db2, log), db2, body.group_id, log, test=body.test, **cut)
-            return {"job_id": job_id, "clips": len(clips_)}
+            job_id, clips_ = run_pipeline(str(src), eff_cfg(db2, log), db2, gid, log, test=body.test, **cut)
+            fan_out(db2, job_id, plan, log)
+            return {"job_id": job_id, "clips": len(clips_) * max(1, len(plan))}
         return started("process", f"{'Тест: ' if body.test else 'Нарезка: '}{src.name}", fn, exclusive=True)
 
     @app.post("/api/files/to-editor")
@@ -1007,9 +1132,20 @@ def create_app(cfg: dict | None = None) -> FastAPI:
 
     sched_lock = threading.Lock()
 
+    stats_last = {"t": 0.0}
+
     def scheduler_loop():
         while True:
             time.sleep(30)
+            # раз в 20 минут тихо обновляем статистику YouTube (1 ед. квоты на 50 видео), чтобы история не была пустой
+            if time.time() - stats_last["t"] > 20 * 60 and not tasks.running("publish", "stats"):
+                stats_last["t"] = time.time()
+                try:
+                    db_s = DB(cfg["paths"]["db"], init=False)
+                    if db_s.publications("youtube"):
+                        service.refresh_stats(db_s, cfg, lambda m: None)
+                except Exception as e:  # нет входа/сети — не страшно, обновится вручную
+                    print("[статистика] пропущено:", str(e)[:200])
             if not sched_lock.acquire(blocking=False):
                 continue
             try:
@@ -1030,7 +1166,7 @@ def create_app(cfg: dict | None = None) -> FastAPI:
         out = []
         for p in d.publications():
             up = (p["uploaded_at"] or "").replace(" ", "T")
-            out.append({"id": p["id"], "title": p["title"], "group": p["group_name"] or "",
+            out.append({"id": p["id"], "title": p["title"], "group": p["group_name"] or "", "group_id": p["group_id"],
                         "account": p["account_label"] or p["platform"], "platform": p["platform"], "url": p["url"],
                         "status": service.pub_status(p), "uploaded_at": up + "Z" if up and "Z" not in up else up,
                         "publish_at": p["publish_at"] or "", "views": p["views"], "likes": p["likes"],

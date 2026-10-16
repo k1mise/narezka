@@ -6,9 +6,10 @@ const ICONS = {
   editor: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M20 4 8.1 15.9M14.5 14.5 20 20M8.1 8.1 12 12"/></svg>',
   accounts: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="9" cy="8" r="4"/><path d="M2 21c0-4 3-6 7-6s7 2 7 6M17 4a4 4 0 0 1 0 8M22 21c0-3-2-5-4-5.6"/></svg>',
   proxies: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c3 3.2 3 14.8 0 18M12 3c-3 3.2-3 14.8 0 18"/></svg>',
+  templates: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="6" rx="1"/><rect x="3" y="13" width="8" height="8" rx="1"/><path d="M15 13h6M15 17h6M15 21h6"/></svg>',
   history: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5M12 7v5l3 2"/></svg>',
 };
-const PAGES = [["panel", "Панель"], ["editor", "Редактор"], ["accounts", "Аккаунты"], ["history", "История"], ["proxies", "Прокси"]];
+const PAGES = [["panel", "Панель"], ["editor", "Редактор"], ["accounts", "Аккаунты"], ["templates", "Шаблоны"], ["history", "История"], ["proxies", "Прокси"]];
 const PLAT = {youtube: ["YT", "YouTube Shorts"], tiktok: ["TT", "TikTok"], instagram: ["IG", "Instagram Reels"]};
 
 const S = {
@@ -112,7 +113,7 @@ function renderHealth() {
 function renderGroupPick() {
   const sel = $("#group"); sel.replaceChildren(...S.groups.map(g => h("option", {value: g.id}, g.name)));
   if (S.gid) sel.value = S.gid;
-  $("#group-pick").hidden = !S.groups.length || ["accounts", "history", "proxies", "editor"].includes(S.page);
+  $("#group-pick").hidden = !S.groups.length || ["accounts", "history", "proxies", "editor", "templates"].includes(S.page);
 }
 function renderPill() {
   const run = S.tasks.filter(t => t.status === "running");
@@ -132,7 +133,7 @@ function render() {
   renderNav(); renderGroupPick();
   const page = $("#page");
   page.replaceChildren();
-  ({panel: pagePanel, editor: pageEditor, accounts: pageAccounts, history: pageHistory, proxies: pageProxies})[S.page](page);
+  ({panel: pagePanel, editor: pageEditor, accounts: pageAccounts, history: pageHistory, proxies: pageProxies, templates: pageTemplates})[S.page](page);
 }
 
 /* ---------- данные ---------- */
@@ -148,6 +149,7 @@ async function loadClips() {
   renderNav();
 }
 async function loadBanners() { S.banners = await api("GET", "/api/banners"); }
+async function loadTemplates() { try { S.templates = await api("GET", "/api/templates"); } catch (e) { S.templates = S.templates || []; } if (S.tplId && !S.templates.some(t => t.id === S.tplId)) S.tplId = null; }
 async function loadHistory() { S.history = await api("GET", "/api/history"); }
 
 /* ---------- фоновые задачи ---------- */
@@ -245,14 +247,21 @@ function pagePanel(page) {
   testBox.checked = !!S.testMode; testBox.onchange = () => { S.testMode = testBox.checked; };
   url.addEventListener("keydown", e => { if (e.key === "Enter") start(); });
   const startBtn = h("button", {class: "btn primary", id: "start", onclick: start}, "Нарезать");
+  const tplSel = h("select", {style: {minWidth: "220px"}}, [h("option", {value: ""}, `Без шаблона — только группа «${g.name}»`),
+    ...(S.templates || []).map(t => h("option", {value: t.id}, `Шаблон: ${t.name} (${t.items.map(i => i.group).join(", ")})`))]);
+  if (S.tplId) tplSel.value = S.tplId;
+  tplSel.onchange = () => { S.tplId = Number(tplSel.value) || null; render(); };
+  const tpl = (S.templates || []).find(t => t.id === S.tplId);
   async function start() {
     try {
-      const t = await api("POST", "/api/process", {url: url.value, group_id: S.gid, test: testBox.checked, ...cutPayload()});
+      const t = await api("POST", "/api/process", {url: url.value, group_id: S.gid, template_id: S.tplId || undefined, test: testBox.checked, ...cutPayload()});
       startTracking(t); url.value = ""; toast("Запустил нарезку"); updateRunBox();
     } catch (e) { fail(e); }
   }
-  page.append(h("div", {class: "card"}, h("h2", {}, "Новое видео", h("small", {}, `группа «${g.name}»`)),
+  page.append(h("div", {class: "card"}, h("h2", {}, "Новое видео", h("small", {}, tpl ? `шаблон «${tpl.name}»` : `группа «${g.name}»`)),
     h("div", {class: "hero-input"}, url, startBtn),
+    h("div", {class: "row", style: {margin: "10px 0"}}, h("span", {class: "muted small"}, "Куда:"), tplSel,
+      tpl ? h("span", {class: "muted small"}, "клипы появятся в каждой группе шаблона, со своим пресетом баннеров") : null),
     cutBox(),
     h("label", {class: "check"}, testBox, h("span", {}, "Тестовый прогон — клипы сохранятся в папку тестов и не будут публиковаться"))));
   page.append(h("div", {id: "runbox"}));
@@ -344,7 +353,9 @@ function publishWindow(ids) {
   const hint = h("div", {class: "note"}), err = h("div", {class: "note warn", style: {display: "none"}});
   const PRIV = {public: "Публично", unlisted: "Доступно по ссылке", private: "Закрытое"};
   const privSel = h("select", {}, Object.entries(PRIV).map(([v, t]) => h("option", {value: v}, t + (v === cfg0.youtube_privacy ? " (как в config.toml)" : ""))));
-  privSel.value = cfg0.youtube_privacy in PRIV ? cfg0.youtube_privacy : "private";
+  let savedPriv = ""; try { savedPriv = localStorage.getItem("pubPrivacy") || ""; } catch (e) {}
+  privSel.value = savedPriv in PRIV ? savedPriv : "public";   // клипы с временем YouTube всё равно сам откроет публично — первый должен быть таким же
+  privSel.addEventListener("change", () => { try { localStorage.setItem("pubPrivacy", privSel.value); } catch (e) {} });
   const intervalMin = () => Math.max(0, Number(amount.value) || 0) * Number(unit.value);
   const startDate = () => startMode.value === "at" && startAt.value ? new Date(startAt.value) : null;
   const whenOf = i => { const iv = intervalMin(), st = startDate();
@@ -444,7 +455,7 @@ function filesCard() {
   };
   async function act(kind, x) {
     try {
-      const payload = {folder: tab, name: x.name, group_id: S.gid, test: !!S.testMode, ...cutPayload()};
+      const payload = {folder: tab, name: x.name, group_id: S.gid, template_id: kind === "slice" ? (S.tplId || undefined) : undefined, test: !!S.testMode, ...cutPayload()};
       const r = await api("POST", "/api/files/" + kind, payload);
       if (kind === "slice") { startTracking(r); toast("Запустил нарезку"); }
       else { toast("Клип добавлен в редактор"); await loadClips(); S.cid = r.id; renderNav(); draw(); }
@@ -908,7 +919,7 @@ function pageAccounts(page) {
       right.append(h("div", {class: "card"}, h("h2", {}, "Добавить аккаунт"), h("div", {class: "row"}, plat, h("div", {class: "grow"}, label),
         h("button", {class: "btn primary", onclick: async () => {
           try { await api("POST", `/api/groups/${sel.id}/accounts`, {platform: plat.value, label: label.value}); await loadGroups(); render(); } catch (e) { fail(e); } }}, "Добавить")),
-        h("div", {class: "hint muted small", style: {marginTop: "10px"}}, "Публикация работает на YouTube Shorts, Instagram Reels и TikTok. Для Instagram и TikTok нужны ключи приложения в файле .env (см. README). У них нет отложенной публикации, поэтому по времени клип выкладывает сама программа — она должна быть запущена.")));
+        h("div", {class: "hint muted small", style: {marginTop: "10px"}}, "Публикация работает на YouTube Shorts, Instagram Reels и TikTok. Для Instagram и TikTok нужны ключи приложения в файле .env (см. README). У них нет отложенной публикации, поэтому по времени клип выкладывает сама программа — она должна быть запущена. В TikTok клип попадает в черновики приложения: подпись, обложку и время (TikTok Studio) ты задаёшь сам.")));
     }
   }
   page.append(h("div", {class: "two"}, left, right));
@@ -934,6 +945,52 @@ async function cancelLogin() {
   try { await api("POST", "/api/login/cancel"); toast("Вход отменён"); } catch (e) { fail(e); }
 }
 
+/* ---------- шаблоны публикации ---------- */
+async function pageTemplates(page) {
+  try { S.presets = await api("GET", "/api/presets"); } catch (e) { S.presets = S.presets || []; }
+  await loadTemplates();
+  const box = h("div", {style: {display: "flex", flexDirection: "column", gap: "16px"}});
+  page.append(h("div", {class: "note", style: {marginBottom: "16px"}}, "Шаблон — это набор групп и для каждой группы свой пресет баннеров. Выбери шаблон на «Панели» перед нарезкой: видео нарежется один раз, а клипы появятся во всех группах шаблона — каждый со своим баннером. Пресеты баннеров создаются в «Редакторе» (кнопка «Сохранить как пресет»)."));
+  const draw = () => {
+    const L = S.templates || [];
+    box.replaceChildren(h("div", {class: "row"}, h("button", {class: "btn primary", onclick: () => edit(null)}, "+ Новый шаблон")),
+      ...(L.length ? L.map(t => h("div", {class: "card"}, h("div", {class: "row", style: {marginBottom: "6px"}}, h("h2", {style: {margin: 0}, class: "grow"}, t.name, t.broken ? h("small", {style: {color: "var(--danger)"}}, "есть удалённая группа или пресет") : null),
+        h("button", {class: "btn sm", onclick: () => edit(t)}, "Изменить"),
+        h("button", {class: "btn sm danger", onclick: () => confirmBox("Удалить шаблон?", `«${t.name}» будет удалён (группы и пресеты не изменятся).`, "Удалить", async () => {
+          try { await api("DELETE", `/api/templates/${t.id}`); await loadTemplates(); draw(); } catch (e) { fail(e); } })}, "Удалить")),
+        t.items.map(i => h("div", {class: "acc"}, h("div", {class: "grow"}, h("b", {}, i.group || "группа удалена"),
+          h("span", {class: "muted small"}, i.preset_id ? `пресет баннеров: ${i.preset || "удалён"}` : "без пресета (баннер по умолчанию)")),
+          i.broken ? h("span", {class: "badge err"}, "исправь") : null))))
+        : [h("div", {class: "card empty"}, h("b", {}, "Шаблонов пока нет"), "Создай шаблон, например «Собаки»: группы A и B, у каждой свой баннер.")]));
+  };
+  function edit(t) {
+    const name = h("input", {type: "text", placeholder: "Например: «Собаки — все каналы»", value: t ? t.name : ""});
+    let rows = t ? t.items.map(i => ({group_id: i.group_id, preset_id: i.preset_id || ""})) : [{group_id: (S.groups[0] || {}).id, preset_id: ""}];
+    const list = h("div", {});
+    const drawRows = () => {
+      const used = new Set(rows.map(r => r.group_id));
+      list.replaceChildren(...rows.map((r, idx) => {
+        const gs = h("select", {style: {flex: "1", minWidth: "140px"}}, S.groups.filter(g => g.id === r.group_id || !used.has(g.id)).map(g => h("option", {value: g.id}, g.name)));
+        gs.value = r.group_id; gs.onchange = () => { r.group_id = Number(gs.value); drawRows(); };
+        const ps = h("select", {style: {flex: "1", minWidth: "140px"}}, [h("option", {value: ""}, "— без пресета —"), ...(S.presets || []).map(p => h("option", {value: p.id}, p.name))]);
+        ps.value = r.preset_id || ""; ps.onchange = () => { r.preset_id = Number(ps.value) || ""; };
+        return h("div", {class: "row", style: {marginBottom: "8px"}}, gs, ps, h("button", {class: "btn sm danger", disabled: rows.length < 2, onclick: () => { rows.splice(idx, 1); drawRows(); }}, "×"));
+      }), h("button", {class: "btn sm", disabled: rows.length >= S.groups.length, onclick: () => { const free = S.groups.find(g => !used.has(g.id)); if (free) { rows.push({group_id: free.id, preset_id: ""}); drawRows(); } }}, "+ Добавить группу"));
+    };
+    drawRows();
+    dialog(h("div", {}, h("h3", {}, t ? "Изменить шаблон" : "Новый шаблон"), h("div", {class: "muted small", style: {marginBottom: "6px"}}, "Название"), name,
+      h("div", {class: "muted small", style: {margin: "12px 0 6px"}}, "Группа → пресет баннеров для её клипов"), list),
+      [{text: "Отмена", cls: "ghost"}, {text: "Сохранить", cls: "primary", fn: async () => {
+        try {
+          await api("POST", "/api/templates", {id: t ? t.id : undefined, name: name.value, items: rows.map(r => ({group_id: r.group_id, preset_id: r.preset_id || null}))});
+          await loadTemplates(); toast("Шаблон сохранён"); draw();
+        } catch (e) { fail(e); } }}]);
+    setTimeout(() => name.focus(), 50);
+  }
+  page.append(box);
+  draw();
+}
+
 /* ---------- история ---------- */
 function pageHistory(page) {
   const bar = h("div", {class: "row", style: {marginBottom: "16px"}},
@@ -941,6 +998,11 @@ function pageHistory(page) {
     h("button", {class: "btn", onclick: () => ask("Добавить в историю", "Ссылки на ранее опубликованные видео YouTube — по одной в строке", "", "Добавить", async v => {
       try { startTracking(await api("POST", "/api/history/import", {urls: v, group_id: S.gid})); } catch (e) { fail(e); } }, true)}, "Добавить старые видео"));
   page.append(bar);
+  // при открытии истории статистика обновляется сама (не чаще раза в 3 минуты), без уведомлений
+  if (Date.now() - (S.statsAuto || 0) > 3 * 60e3 && (S.history || []).some(p => p.platform === "youtube")) {
+    S.statsAuto = Date.now();
+    api("POST", "/api/history/refresh").then(() => setTimeout(async () => { try { await loadHistory(); if (S.page === "history") render(); } catch (e) {} }, 4000)).catch(() => {});
+  }
   const sched = h("div", {}); page.append(sched);
   const drawSched = async () => {
     let L = []; try { L = await api("GET", "/api/scheduled"); } catch (e) {}
@@ -958,17 +1020,38 @@ function pageHistory(page) {
     if (!H.length) { box.replaceChildren(h("div", {class: "card empty"}, h("b", {}, "История пуста"), "Опубликованные видео появятся здесь.")); return; }
     const open = p => window.open(p.url, "_blank", "noopener");
     const thumb = p => h("div", {class: "thumb", style: p.has_thumb ? {backgroundImage: `url(/api/history/${p.id}/thumb)`} : {}}, p.has_thumb ? "" : "нет");
-    const st = p => h("span", {class: "badge " + (p.status === "Опубликовано" ? "ok" : p.status === "Удалено" ? "err" : p.status.startsWith("Запл") ? "warn" : "")}, p.status);
+    const st = p => h("span", {class: "badge " + (p.status === "Опубликовано" ? "ok" : p.status === "Удалено" ? "err" : p.status.startsWith("Запл") || p.status.startsWith("В черн") ? "warn" : "")}, p.status);
     const when = p => fmtLocal(p.uploaded_at);
-    const table = h("table", {class: "htable"}, h("thead", {}, h("tr", {}, ["Видео", "Аккаунт", "Статус", "Просмотры", "Лайки", "Коммент.", "Загружено"].map((t, i) => h("th", {class: i > 2 && i < 6 ? "num" : ""}, t)))),
-      h("tbody", {}, H.map(p => h("tr", {class: "link", onclick: () => open(p)},
-        h("td", {}, h("div", {class: "hcell"}, thumb(p), h("div", {}, h("b", {}, p.title || "Без названия"), h("span", {class: "muted small"}, p.group)))),
+    const rowsOf = L => h("table", {class: "htable"}, h("thead", {}, h("tr", {}, ["Видео", "Аккаунт", "Статус", "Просмотры", "Лайки", "Коммент.", "Загружено"].map((t, i) => h("th", {class: i > 2 && i < 6 ? "num" : ""}, t)))),
+      h("tbody", {}, L.map(p => h("tr", {class: "link", onclick: () => open(p)},
+        h("td", {}, h("div", {class: "hcell"}, thumb(p), h("div", {}, h("b", {}, p.title || "Без названия")))),
         h("td", {}, p.account, h("div", {class: "muted small"}, platName(p.platform))), h("td", {}, st(p)), h("td", {class: "num"}, fmtNum(p.views)), h("td", {class: "num"}, fmtNum(p.likes)),
         h("td", {class: "num"}, fmtNum(p.comments)), h("td", {class: "muted small"}, when(p))))));
-    const cards = h("div", {class: "cards"}, H.map(p => h("div", {class: "card", style: {cursor: "pointer"}, onclick: () => open(p)},
+    const cardsOf = L => h("div", {class: "cards"}, L.map(p => h("div", {class: "card", style: {cursor: "pointer"}, onclick: () => open(p)},
       h("div", {class: "hcell"}, thumb(p), h("div", {}, h("b", {}, p.title || "Без названия"), h("div", {class: "row", style: {gap: "8px", marginTop: "4px"}}, st(p), h("span", {class: "muted small"}, `${platName(p.platform)} · ${p.account}`)),
         h("div", {class: "muted small", style: {marginTop: "6px"}}, `👁 ${fmtNum(p.views)} · 👍 ${fmtNum(p.likes)} · 💬 ${fmtNum(p.comments)}`))))));
-    box.replaceChildren(h("div", {class: "card tcard", style: {padding: "8px 10px", overflowX: "auto"}}, table), cards);
+    // по группам: порядок как в «Аккаунтах», затем остальные (удалённые группы) в конце
+    const byG = new Map();
+    for (const p of H) { const k = p.group_id || 0; if (!byG.has(k)) byG.set(k, []); byG.get(k).push(p); }
+    const order = [...S.groups.map(g => g.id).filter(id => byG.has(id)), ...[...byG.keys()].filter(k => !S.groups.some(g => g.id === k))];
+    S.histClosed = S.histClosed || new Set();
+    const sum = (L, f) => L.reduce((a, p) => a + (p[f] || 0), 0);
+    const total = {n: H.length, v: sum(H, "views"), l: sum(H, "likes"), c: sum(H, "comments")};
+    const secs = order.map(k => {
+      const L = byG.get(k), name = (S.groups.find(g => g.id === k) || {}).name || L[0].group || "Без группы";
+      const closed = S.histClosed.has(k);
+      const plats = ["youtube", "tiktok", "instagram"].map(pl => [pl, L.filter(p => p.platform === pl)]).filter(([_, x]) => x.length);
+      const wrap = h("div", {class: "card hgroup", style: {padding: "8px 10px"}});
+      const head = h("div", {class: "hgroup-head", onclick: () => { closed ? S.histClosed.delete(k) : S.histClosed.add(k); draw(); }},
+        h("span", {class: "caret"}, closed ? "▸" : "▾"), h("b", {class: "grow"}, name),
+        h("span", {class: "muted small"}, plats.map(([pl, x]) => `${platName(pl)}: ${x.length}`).join(" · ")),
+        h("span", {class: "hstat"}, `${L.length} видео`), h("span", {class: "hstat"}, `👁 ${fmtNum(sum(L, "views"))}`), h("span", {class: "hstat"}, `👍 ${fmtNum(sum(L, "likes"))}`), h("span", {class: "hstat"}, `💬 ${fmtNum(sum(L, "comments"))}`));
+      wrap.append(head);
+      if (!closed) wrap.append(h("div", {class: "tcard", style: {overflowX: "auto"}}, rowsOf(L)), cardsOf(L));
+      return wrap;
+    });
+    box.replaceChildren(h("div", {class: "muted small", style: {margin: "0 4px 10px"}}, `Всего: ${total.n} видео · 👁 ${fmtNum(total.v)} · 👍 ${fmtNum(total.l)} · 💬 ${fmtNum(total.c)}`),
+      h("div", {style: {display: "flex", flexDirection: "column", gap: "14px"}}, secs));
   };
   if (S.history) draw();
   loadHistory().then(draw).catch(fail);
@@ -1028,7 +1111,7 @@ async function init() {
   addEventListener("hashchange", render);
   try {
     [S.cfg, S.health] = await Promise.all([api("GET", "/api/config"), api("GET", "/api/health")]);
-    await loadGroups(); await loadClips();
+    await loadGroups(); await loadClips(); await loadTemplates();
   } catch (e) { fail(e); }
   renderHealth(); render(); pollTasks();
   setInterval(async () => { try { S.health = await api("GET", "/api/health"); renderHealth(); } catch (e) {} }, 15000);
