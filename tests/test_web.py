@@ -982,7 +982,9 @@ def test_process_with_template_fans_out_clips(env, monkeypatch):
     g1, g2, g3 = db.add_group("A"), db.add_group("B"), db.add_group("C")
     p1 = c.post("/api/presets", json={"name": "П1", "tags": "один", "footer": "Футер 1"}).json()
     p2 = c.post("/api/presets", json={"name": "П2", "tags": "два"}).json()
-    tpl = c.post("/api/templates", json={"name": "Т", "items": [{"group_id": g2, "preset_id": p1["id"]}, {"group_id": g3, "preset_id": p2["id"]}]}).json()
+    tpl = c.post("/api/templates", json={"name": "Т", "tags": "собаки, щенки", "items": [
+        {"group_id": g2, "preset_id": p1["id"], "tags": "игры"}, {"group_id": g3, "preset_id": p2["id"]}]}).json()
+    assert tpl["tags"] == "#собаки #щенки" and tpl["items"][0]["tags"] == "#игры" and tpl["items"][1]["tags"] == ""
     assert c.post("/api/process", json={"url": "https://x.y/v", "template_id": 999}).status_code == 404
 
     def fake(url, cfg_, db_, gid, log, **k):
@@ -999,6 +1001,8 @@ def test_process_with_template_fans_out_clips(env, monkeypatch):
     assert by[g1] == [] and len(by[g2]) == 2 and len(by[g3]) == 2
     assert "#один" in by[g2][0]["tags"] and "Футер 1" in by[g2][0]["description"]
     assert "#два" in by[g3][0]["tags"] and "#один" not in by[g3][0]["tags"] and "Футер" not in by[g3][0]["description"]
+    assert by[g2][0]["tags"].startswith("#собаки #щенки #игры") and "#a" in by[g2][0]["tags"]      # теги шаблона и группы — первыми
+    assert by[g3][0]["tags"].startswith("#собаки #щенки") and "#игры" not in by[g3][0]["tags"]
     paths = {db.clip(x["id"])["path"] for g in (g2, g3) for x in by[g]}
     assert len(paths) == 4 and all(Path(p).exists() for p in paths)           # у каждой копии свой файл
 

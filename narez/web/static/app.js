@@ -957,22 +957,23 @@ async function pageTemplates(page) {
   try { S.presets = await api("GET", "/api/presets"); } catch (e) { S.presets = S.presets || []; }
   await loadTemplates();
   const box = h("div", {style: {display: "flex", flexDirection: "column", gap: "16px"}});
-  page.append(h("div", {class: "note", style: {marginBottom: "16px"}}, "Шаблон — это набор групп и для каждой группы свой пресет баннеров. Выбери шаблон на «Панели» перед нарезкой: видео нарежется один раз, а клипы появятся во всех группах шаблона — каждый со своим баннером. Пресеты баннеров создаются в «Редакторе» (кнопка «Сохранить как пресет»)."));
+  page.append(h("div", {class: "note", style: {marginBottom: "16px"}}, "Шаблон — это набор групп, для каждой свой пресет баннеров, плюс хэштеги (общие для всего шаблона и отдельные для группы). Выбери шаблон на «Панели» перед нарезкой: видео нарежется один раз, а клипы появятся во всех группах шаблона — каждый со своим баннером. Пресеты баннеров создаются в «Редакторе» (кнопка «Сохранить как пресет»)."));
   const draw = () => {
     const L = S.templates || [];
     box.replaceChildren(h("div", {class: "row"}, h("button", {class: "btn primary", onclick: () => edit(null)}, "+ Новый шаблон")),
-      ...(L.length ? L.map(t => h("div", {class: "card"}, h("div", {class: "row", style: {marginBottom: "6px"}}, h("h2", {style: {margin: 0}, class: "grow"}, t.name, t.broken ? h("small", {style: {color: "var(--danger)"}}, "есть удалённая группа или пресет") : null),
+      ...(L.length ? L.map(t => h("div", {class: "card"}, h("div", {class: "row", style: {marginBottom: "6px"}}, h("h2", {style: {margin: 0}, class: "grow"}, t.name, t.tags ? h("small", {}, t.tags) : null, t.broken ? h("small", {style: {color: "var(--danger)"}}, "есть удалённая группа или пресет") : null),
         h("button", {class: "btn sm", onclick: () => edit(t)}, "Изменить"),
         h("button", {class: "btn sm danger", onclick: () => confirmBox("Удалить шаблон?", `«${t.name}» будет удалён (группы и пресеты не изменятся).`, "Удалить", async () => {
           try { await api("DELETE", `/api/templates/${t.id}`); await loadTemplates(); draw(); } catch (e) { fail(e); } })}, "Удалить")),
         t.items.map(i => h("div", {class: "acc"}, h("div", {class: "grow"}, h("b", {}, i.group || "группа удалена"),
-          h("span", {class: "muted small"}, i.preset_id ? `пресет баннеров: ${i.preset || "удалён"}` : "без пресета (баннер по умолчанию)")),
+          h("span", {class: "muted small"}, (i.preset_id ? `пресет баннеров: ${i.preset || "удалён"}` : "без пресета (баннер по умолчанию)") + (i.tags ? ` · теги группы: ${i.tags}` : ""))),
           i.broken ? h("span", {class: "badge err"}, "исправь") : null))))
         : [h("div", {class: "card empty"}, h("b", {}, "Шаблонов пока нет"), "Создай шаблон, например «Собаки»: группы A и B, у каждой свой баннер.")]));
   };
   function edit(t) {
     const name = h("input", {type: "text", placeholder: "Например: «Собаки — все каналы»", value: t ? t.name : ""});
-    let rows = t ? t.items.map(i => ({group_id: i.group_id, preset_id: i.preset_id || ""})) : [{group_id: (S.groups[0] || {}).id, preset_id: ""}];
+    const tags = h("input", {type: "text", placeholder: "#собаки #щенки — для клипов всех групп шаблона", value: t ? t.tags || "" : ""});
+    let rows = t ? t.items.map(i => ({group_id: i.group_id, preset_id: i.preset_id || "", tags: i.tags || ""})) : [{group_id: (S.groups[0] || {}).id, preset_id: "", tags: ""}];
     const list = h("div", {});
     const drawRows = () => {
       const used = new Set(rows.map(r => r.group_id));
@@ -981,15 +982,17 @@ async function pageTemplates(page) {
         gs.value = r.group_id; gs.onchange = () => { r.group_id = Number(gs.value); drawRows(); };
         const ps = h("select", {style: {flex: "1", minWidth: "140px"}}, [h("option", {value: ""}, "— без пресета —"), ...(S.presets || []).map(p => h("option", {value: p.id}, p.name))]);
         ps.value = r.preset_id || ""; ps.onchange = () => { r.preset_id = Number(ps.value) || ""; };
-        return h("div", {class: "row", style: {marginBottom: "8px"}}, gs, ps, h("button", {class: "btn sm danger", disabled: rows.length < 2, onclick: () => { rows.splice(idx, 1); drawRows(); }}, "×"));
-      }), h("button", {class: "btn sm", disabled: rows.length >= S.groups.length, onclick: () => { const free = S.groups.find(g => !used.has(g.id)); if (free) { rows.push({group_id: free.id, preset_id: ""}); drawRows(); } }}, "+ Добавить группу"));
+        const tg = h("input", {type: "text", placeholder: "теги этой группы", value: r.tags || "", style: {flex: "1", minWidth: "140px"}, oninput: () => { r.tags = tg.value; }});
+        return h("div", {class: "row", style: {marginBottom: "8px"}}, gs, ps, tg, h("button", {class: "btn sm danger", disabled: rows.length < 2, onclick: () => { rows.splice(idx, 1); drawRows(); }}, "×"));
+      }), h("button", {class: "btn sm", disabled: rows.length >= S.groups.length, onclick: () => { const free = S.groups.find(g => !used.has(g.id)); if (free) { rows.push({group_id: free.id, preset_id: "", tags: ""}); drawRows(); } }}, "+ Добавить группу"));
     };
     drawRows();
     dialog(h("div", {}, h("h3", {}, t ? "Изменить шаблон" : "Новый шаблон"), h("div", {class: "muted small", style: {marginBottom: "6px"}}, "Название"), name,
-      h("div", {class: "muted small", style: {margin: "12px 0 6px"}}, "Группа → пресет баннеров для её клипов"), list),
+      h("div", {class: "muted small", style: {margin: "12px 0 6px"}}, "Хэштеги для всех групп шаблона"), tags,
+      h("div", {class: "muted small", style: {margin: "12px 0 6px"}}, "Группа → пресет баннеров → свои хэштеги группы"), list),
       [{text: "Отмена", cls: "ghost"}, {text: "Сохранить", cls: "primary", fn: async () => {
         try {
-          await api("POST", "/api/templates", {id: t ? t.id : undefined, name: name.value, items: rows.map(r => ({group_id: r.group_id, preset_id: r.preset_id || null}))});
+          await api("POST", "/api/templates", {id: t ? t.id : undefined, name: name.value, tags: tags.value, items: rows.map(r => ({group_id: r.group_id, preset_id: r.preset_id || null, tags: r.tags || ""}))});
           await loadTemplates(); toast("Шаблон сохранён"); draw();
         } catch (e) { fail(e); } }}]);
     setTimeout(() => name.focus(), 50);

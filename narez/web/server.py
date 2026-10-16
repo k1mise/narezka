@@ -127,11 +127,13 @@ class FileIn(CutIn):
 class TemplateItemIn(BaseModel):
     group_id: int
     preset_id: Optional[int] = None
+    tags: str = ""                 # хэштеги только для этой группы
 
 
 class TemplateIn(BaseModel):
     id: Optional[int] = None
     name: str
+    tags: str = ""                 # хэштеги для клипов всех групп шаблона
     items: list[TemplateItemIn]
 
 
@@ -699,9 +701,10 @@ def create_app(cfg: dict | None = None) -> FastAPI:
         for it in json.loads(r["data"] or "{}").get("items", []):
             g = d.group(it["group_id"])
             pr = d.preset(it["preset_id"]) if it.get("preset_id") else None
-            items.append({"group_id": it["group_id"], "group": g["name"] if g else "", "preset_id": it.get("preset_id"),
+            items.append({"group_id": it["group_id"], "group": g["name"] if g else "", "preset_id": it.get("preset_id"), "tags": it.get("tags", ""),
                           "preset": pr["name"] if pr else "", "broken": not g or (bool(it.get("preset_id")) and not pr)})
-        return {"id": r["id"], "name": r["name"], "items": items, "broken": any(i["broken"] for i in items)}
+        return {"id": r["id"], "name": r["name"], "tags": json.loads(r["data"] or "{}").get("tags", ""), "items": items,
+                "broken": any(i["broken"] for i in items)}
 
     @app.get("/api/templates")
     def templates(d: DB = Depends(get_db)):
@@ -727,7 +730,8 @@ def create_app(cfg: dict | None = None) -> FastAPI:
         other = next((t for t in d.templates() if t["name"].lower() == name.lower() and t["id"] != body.id), None)
         if other:
             raise HTTPException(400, f"Шаблон «{name}» уже есть")
-        tid = d.save_template(name, {"items": [{"group_id": i.group_id, "preset_id": i.preset_id or None} for i in body.items]}, body.id)
+        tid = d.save_template(name, {"tags": normalize_tags(body.tags),
+                                     "items": [{"group_id": i.group_id, "preset_id": i.preset_id or None, "tags": normalize_tags(i.tags)} for i in body.items]}, body.id)
         return template_json(d.template(tid), d)
 
     @app.delete("/api/templates/{tpl_id}")
@@ -746,7 +750,8 @@ def create_app(cfg: dict | None = None) -> FastAPI:
         if not r:
             raise HTTPException(404, "Шаблон не найден")
         plan = []
-        for it in json.loads(r["data"] or "{}").get("items", []):
+        tdata = json.loads(r["data"] or "{}")
+        for it in tdata.get("items", []):
             if not d.group(it["group_id"]):
                 raise HTTPException(400, "В шаблоне есть удалённая группа — отредактируй шаблон")
             pr = None
@@ -759,7 +764,7 @@ def create_app(cfg: dict | None = None) -> FastAPI:
                     preset_banner_spec(pr)
                 except ValueError as e:
                     raise HTTPException(400, str(e)) from None
-            plan.append((it["group_id"], pr))
+            plan.append((it["group_id"], pr, normalize_tags((tdata.get("tags", "") + " " + it.get("tags", "")).strip())))
         if not plan:
             raise HTTPException(400, "Шаблон пуст")
         return plan[0][0], plan
@@ -770,7 +775,7 @@ def create_app(cfg: dict | None = None) -> FastAPI:
             return
         base = [c["id"] for c in d.clips(job_id)]
         by_group = {plan[0][0]: list(base)}
-        for gid, _ in plan[1:]:
+        for gid, _, _t in plan[1:]:
             ids = []
             for cid in base:
                 c = d.clip(cid)
@@ -784,14 +789,17 @@ def create_app(cfg: dict | None = None) -> FastAPI:
                     tdst = str(t2)
                 ids.append(d.copy_clip(cid, str(dst), tdst, gid))
             by_group[gid] = ids
-        for gid, pr in plan:
+        for gid, pr, extra in plan:
             ids = by_group[gid]
             for cid in ids:
                 d.update_clip(cid, group_id=gid)
             g = d.group(gid)
             if pr:
                 apply_preset_to(d, pr, preset_banner_spec(pr), ids)
-            log(f"Группа «{g['name']}»: {len(ids)} клип(ов)" + (f", пресет «{pr['name']}»" if pr else ""))
+            if extra:  # хэштеги шаблона ставим первыми: при лимите в 15 тегов обрезаются остальные, а не они
+                for cid in ids:
+                    d.update_clip(cid, tags=normalize_tags(extra + " " + (d.clip(cid)["tags"] or "")))
+            log(f"Группа «{g['name']}»: {len(ids)} клип(ов)" + (f", пресет «{pr['name']}»" if pr else "") + (f", теги {extra}" if extra else ""))
 
     # ---------- папки и файлы ----------
     VIDEO_EXT = {".mp4", ".mkv", ".mov", ".webm", ".m4v", ".avi", ".flv", ".ts", ".mpg", ".mpeg", ".wmv"}
