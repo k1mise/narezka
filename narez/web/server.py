@@ -99,6 +99,7 @@ class ProxyUseIn(BaseModel):
 
 
 class PresetIn(BaseModel):
+    id: Optional[int] = None     # задан — правка существующего пресета (можно переименовать), иначе создание/перезапись по имени
     name: str
     banner: Optional[dict] = None
     banners: Optional[list[dict]] = None
@@ -645,6 +646,13 @@ def create_app(cfg: dict | None = None) -> FastAPI:
                 "footer": body.footer.strip()}
         if not (data["banners"] or data["tags"] or data["footer"]):
             raise HTTPException(400, "В пресете пусто: выбери баннер, теги или текст в конце описания")
+        if body.id:
+            if not d.preset(body.id):
+                raise HTTPException(404, "Пресет не найден")
+            if any(r["id"] != body.id and r["name"].lower() == name.lower() for r in d.presets()):
+                raise HTTPException(400, f"Пресет «{name}» уже есть")
+            d.update_preset(body.id, name, data)
+            return preset_json(d.preset(body.id))
         return preset_json(d.preset(d.save_preset(name, data)))
 
     @app.delete("/api/presets/{preset_id}")

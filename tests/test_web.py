@@ -1027,3 +1027,15 @@ def test_process_passes_adcut_flags_and_config_defaults(env, monkeypatch):
     wait_task(c, c.post("/api/process", json={"url": "https://x.y/v", "group_id": g}).json())
     assert got[0]["adcut_sb"] is False and got[0]["adcut_text"] is True
     assert got[1]["adcut_sb"] is None and got[1]["adcut_text"] is None      # None = как в config.toml
+
+
+def test_preset_edit_by_id_and_rename(env):
+    c, cfg, db, _ = env
+    a = c.post("/api/presets", json={"name": "А", "tags": "один"}).json()
+    b = c.post("/api/presets", json={"name": "Б", "tags": "два"}).json()
+    r = c.post("/api/presets", json={"id": a["id"], "name": "А2", "tags": "три", "footer": "ф"}).json()
+    assert r["id"] == a["id"] and r["name"] == "А2" and r["tags"] == "#три" and r["footer"] == "ф"
+    assert sorted(x["name"] for x in c.get("/api/presets").json()) == ["А2", "Б"]       # переименовали, а не создали новый
+    assert c.post("/api/presets", json={"id": a["id"], "name": "б", "tags": "x"}).status_code == 400   # занято другим пресетом
+    assert c.post("/api/presets", json={"id": 999, "name": "Я", "tags": "x"}).status_code == 404
+    assert c.post("/api/presets", json={"id": b["id"], "name": "Б"}).status_code == 400                 # пустой пресет

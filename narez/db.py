@@ -266,6 +266,10 @@ class DB:
         self.c.commit()
         return self.c.execute("SELECT id FROM presets WHERE name=?", (name,)).fetchone()["id"]
 
+    def update_preset(self, preset_id: int, name: str, data: dict):
+        self.c.execute("UPDATE presets SET name=?, data=? WHERE id=?", (name, json.dumps(data, ensure_ascii=False), preset_id))
+        self.c.commit()
+
     def delete_preset(self, preset_id: int):
         self.c.execute("DELETE FROM presets WHERE id=?", (preset_id,))
         self.c.commit()

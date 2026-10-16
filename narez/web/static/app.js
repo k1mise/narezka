@@ -7,9 +7,10 @@ const ICONS = {
   accounts: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="9" cy="8" r="4"/><path d="M2 21c0-4 3-6 7-6s7 2 7 6M17 4a4 4 0 0 1 0 8M22 21c0-3-2-5-4-5.6"/></svg>',
   proxies: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c3 3.2 3 14.8 0 18M12 3c-3 3.2-3 14.8 0 18"/></svg>',
   templates: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="6" rx="1"/><rect x="3" y="13" width="8" height="8" rx="1"/><path d="M15 13h6M15 17h6M15 21h6"/></svg>',
+  presets: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 6h10M18 6h2M4 12h4M12 12h8M4 18h12M20 18h0"/><circle cx="16" cy="6" r="2"/><circle cx="10" cy="12" r="2"/><circle cx="18" cy="18" r="2"/></svg>',
   history: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5M12 7v5l3 2"/></svg>',
 };
-const PAGES = [["panel", "Панель"], ["editor", "Редактор"], ["accounts", "Аккаунты"], ["templates", "Шаблоны"], ["history", "История"], ["proxies", "Прокси"]];
+const PAGES = [["panel", "Панель"], ["editor", "Редактор"], ["accounts", "Аккаунты"], ["presets", "Пресеты"], ["templates", "Шаблоны"], ["history", "История"], ["proxies", "Прокси"]];
 const PLAT = {youtube: ["YT", "YouTube Shorts"], tiktok: ["TT", "TikTok"], instagram: ["IG", "Instagram Reels"]};
 
 const S = {
@@ -113,7 +114,7 @@ function renderHealth() {
 function renderGroupPick() {
   const sel = $("#group"); sel.replaceChildren(...S.groups.map(g => h("option", {value: g.id}, g.name)));
   if (S.gid) sel.value = S.gid;
-  $("#group-pick").hidden = !S.groups.length || ["accounts", "history", "proxies", "editor", "templates"].includes(S.page);
+  $("#group-pick").hidden = !S.groups.length || ["accounts", "history", "proxies", "editor", "templates", "presets"].includes(S.page);
 }
 function renderPill() {
   const run = S.tasks.filter(t => t.status === "running");
@@ -133,7 +134,7 @@ function render() {
   renderNav(); renderGroupPick();
   const page = $("#page");
   page.replaceChildren();
-  ({panel: pagePanel, editor: pageEditor, accounts: pageAccounts, history: pageHistory, proxies: pageProxies, templates: pageTemplates})[S.page](page);
+  ({panel: pagePanel, editor: pageEditor, accounts: pageAccounts, history: pageHistory, proxies: pageProxies, templates: pageTemplates, presets: pagePresets})[S.page](page);
 }
 
 /* ---------- данные ---------- */
@@ -950,6 +951,89 @@ async function login(a) {
 }
 async function cancelLogin() {
   try { await api("POST", "/api/login/cancel"); toast("Вход отменён"); } catch (e) { fail(e); }
+}
+
+/* ---------- пресеты (без клипа) ---------- */
+async function pagePresets(page) {
+  try { S.presets = await api("GET", "/api/presets"); } catch (e) { S.presets = S.presets || []; }
+  if (!S.banners.length) { try { await loadBanners(); } catch (e) {} }
+  const box = h("div", {style: {display: "flex", flexDirection: "column", gap: "16px"}});
+  page.append(h("div", {class: "note", style: {marginBottom: "16px"}}, "Пресет — набор баннеров с настройками, хэштеги и текст в конце описания. Его можно создать здесь, без клипа, и использовать в шаблонах или применять к клипам в «Редакторе». Предпросмотр баннера на видео — в «Редакторе»: применить пресет к клипу и посмотреть."), box);
+  const dflt = kind => ({...(S.cfg.banner_defaults[kind] || S.cfg.banner_defaults.image)});
+  const fresh = b => ({name: b.name, ...dflt(b.kind)});
+  const draw = () => {
+    const L = S.presets || [];
+    box.replaceChildren(h("div", {class: "row"}, h("button", {class: "btn primary", onclick: () => edit({id: null, name: "", tags: "", footer: "", banners: []})}, "+ Новый пресет")),
+      ...(L.length ? L.map(p => h("div", {class: "card"}, h("div", {class: "row", style: {marginBottom: "6px"}}, h("h2", {style: {margin: 0}, class: "grow"}, p.name),
+        h("button", {class: "btn sm", onclick: () => edit({id: p.id, name: p.name, tags: p.tags || "", footer: p.footer || "", banners: (p.banners || []).map(x => ({...x}))})}, "Изменить"),
+        h("button", {class: "btn sm danger", onclick: () => confirmBox("Удалить пресет?", `«${p.name}» будет удалён (клипы и шаблоны не изменятся, но шаблон без пресета станет «без пресета»).`, "Удалить", async () => {
+          try { await api("DELETE", `/api/presets/${p.id}`); await refresh(); } catch (e) { fail(e); } })}, "Удалить")),
+        h("div", {class: "muted small"}, [(p.banners || []).length ? `баннеры: ${p.banners.map(x => x.name).join(", ")}` : "", p.tags ? `теги: ${p.tags}` : "", p.footer ? `в конце описания: «${p.footer.slice(0, 80)}${p.footer.length > 80 ? "…" : ""}»` : ""].filter(Boolean).join(" · "))))
+        : [h("div", {class: "card empty"}, h("b", {}, "Пресетов пока нет"), "Создай первый: например «Реклама казино — внизу» с баннером и тегами.")]));
+  };
+  const refresh = async () => { S.presets = await api("GET", "/api/presets"); draw(); };
+  function edit(p) {
+    const name = h("input", {type: "text", placeholder: "Например: «Реклама казино — внизу»", value: p.name});
+    const tags = h("input", {type: "text", placeholder: "#теги, которые добавятся ко всем клипам", value: p.tags});
+    const foot = h("textarea", {placeholder: "Текст, который допишется в конец описания (ссылка, промокод…)", style: {minHeight: "70px"}}); foot.value = p.footer;
+    const list = h("div", {});
+    const max = S.cfg.max_banners || 5;
+    const num = (sp, key, label, step, min, max_) => { const i = h("input", {type: "number", step: String(step), min: String(min), max: String(max_), value: sp[key] ?? 0, oninput: () => { sp[key] = i.value === "" ? 0 : +i.value; }});
+      return h("div", {class: "field"}, h("label", {}, label), i); };
+    const drawBanners = () => {
+      list.replaceChildren(...[...p.banners.map((sp, idx) => {
+        const b = S.banners.find(x => x.name === sp.name), isVideo = b && b.kind === "video";
+        const file = h("select", {style: {flex: "1", minWidth: "160px"}}, [...(b ? [] : [h("option", {value: sp.name}, `⚠ ${sp.name} (файла нет)`)]),
+          ...S.banners.map(x => h("option", {value: x.name}, `${x.name} · ${x.kind === "video" ? x.duration + " с" : "картинка"}`))]);
+        file.value = sp.name;
+        file.onchange = () => { const nb = S.banners.find(x => x.name === file.value); if (nb) { p.banners[idx] = fresh(nb); drawBanners(); } };
+        const up = h("label", {class: "btn sm"}, "+ файл", h("input", {type: "file", hidden: true, accept: "image/*,video/*", onchange: async e => {
+          const f = e.target.files[0]; if (!f) return; toast("Загружаю баннер…");
+          try { const r = await api("PUT", "/api/banners?name=" + encodeURIComponent(f.name), undefined, f); await loadBanners();
+            const nb = S.banners.find(x => x.name === r.name) || r; p.banners[idx] = fresh(nb); drawBanners(); } catch (er) { fail(er); } }}));
+        const mode = h("select", {onchange: () => { sp.start_mode = mode.value; drawBanners(); }}, [["seconds", "В секундах"], ["percent", "В % видео"]].map(([v, t]) => h("option", {value: v}, t)));
+        mode.value = sp.start_mode === "percent" ? "percent" : "seconds";
+        const pos = h("select", {onchange: () => { sp.position = pos.value; }}, [["center", "По центру"], ["top", "Сверху"], ["bottom", "Снизу"]].map(([v, t]) => h("option", {value: v}, t)));
+        pos.value = sp.position || "center";
+        const pause = h("input", {type: "checkbox", onchange: () => { sp.pause = pause.checked; }}); pause.checked = !!sp.pause;
+        let chroma = null;
+        if (isVideo) {
+          const cc = h("input", {type: "checkbox", onchange: () => { sp.chroma = cc.checked; col.disabled = !cc.checked; }}); cc.checked = !!sp.chroma;
+          const col = h("input", {type: "color", value: sp.chroma_color || b.key || "#00ff00", disabled: !sp.chroma, style: {width: "40px", height: "28px", padding: "0", border: "none", background: "none"}, onchange: () => { sp.chroma_color = col.value; }});
+          chroma = h("div", {class: "row", style: {gap: "8px"}}, h("label", {class: "check"}, cc, h("span", {}, "Убрать однотонный фон")), col);
+        }
+        return h("div", {class: "bncard"}, h("div", {class: "row", style: {marginBottom: "10px"}}, h("b", {}, `Баннер ${idx + 1}`), file, up,
+          h("button", {class: "btn sm danger", onclick: () => { p.banners.splice(idx, 1); drawBanners(); }}, "Убрать")),
+          h("div", {class: "row", style: {alignItems: "end", gap: "12px"}},
+            h("div", {class: "field"}, h("label", {}, "Начало"), mode),
+            sp.start_mode === "percent" ? num(sp, "start_percent", "Начало, % видео", 1, 0, 99) : num(sp, "start", "Начало, с", 0.5, 0, 3600),
+            num(sp, "duration", isVideo ? "Длительность, с (0 = целиком)" : "Длительность, с", 0.5, 0, 600),
+            num(sp, "width_percent", "Ширина, %", 5, 10, 100),
+            h("div", {class: "field"}, h("label", {}, "Положение"), pos),
+            num(sp, "margin", "Отступ, px", 10, 0, 800), num(sp, "duck_percent", "Громкость основного, %", 5, 0, 100),
+            h("label", {class: "check"}, pause, h("span", {}, "Пауза на баннере"))), chroma);
+      }), h("button", {class: "btn sm", disabled: p.banners.length >= max || !S.banners.length, onclick: () => { p.banners.push(fresh(S.banners[0])); drawBanners(); }},
+        S.banners.length ? "+ Добавить баннер" : "Сначала загрузи баннер: «+ файл» появится после первого баннера"),
+        S.banners.length ? null : h("label", {class: "btn sm", style: {marginLeft: "8px"}}, "Загрузить файл баннера", h("input", {type: "file", hidden: true, accept: "image/*,video/*", onchange: async e => {
+          const f = e.target.files[0]; if (!f) return; toast("Загружаю баннер…");
+          try { await api("PUT", "/api/banners?name=" + encodeURIComponent(f.name), undefined, f); await loadBanners(); p.banners.push(fresh(S.banners[0] && S.banners.find(x => x.name === f.name) || S.banners[0])); drawBanners(); } catch (er) { fail(er); } }}))].filter(Boolean));
+    };
+    drawBanners();
+    box.replaceChildren(h("div", {class: "card"}, h("h2", {}, p.id ? "Изменить пресет" : "Новый пресет"),
+      h("div", {class: "field"}, h("label", {}, "Название"), name),
+      h("div", {class: "muted small", style: {margin: "14px 0 8px"}}, `Баннеры (до ${max}) — настройки такие же, как в «Редакторе»`), list,
+      h("div", {class: "field", style: {marginTop: "14px"}}, h("label", {}, "Теги"), tags),
+      h("div", {class: "field"}, h("label", {}, "Текст в конце описания"), foot),
+      h("div", {class: "row", style: {marginTop: "14px", justifyContent: "flex-end"}},
+        h("button", {class: "btn ghost", onclick: draw}, "Отмена"),
+        h("button", {class: "btn primary", onclick: async () => {
+          try {
+            await api("POST", "/api/presets", {id: p.id || undefined, name: name.value, tags: tags.value, footer: foot.value, banners: p.banners});
+            toast("Пресет сохранён"); await refresh();
+          } catch (e) { fail(e); } }}, "Сохранить"))));
+    setTimeout(() => name.focus(), 50);
+  }
+  draw();
 }
 
 /* ---------- шаблоны публикации ---------- */
