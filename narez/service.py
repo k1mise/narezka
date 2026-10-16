@@ -142,6 +142,8 @@ def pub_status(p) -> str:
 def refresh_stats(db, cfg: dict, log=print) -> int:
     """Обновляет просмотры/лайки/комментарии и статус всех видео истории (videos.list: 1 ед. квоты на 50 видео).
     Возвращает число обновлённых видео. Если нужен повторный вход в YouTube — бросает ScopeError."""
+    from .history import sync_channels
+    sync_channels(db, cfg, get_publisher("youtube", cfg), log)   # сначала досыпаем в историю то, чего в ней нет, но что есть на канале
     by_acc: dict[int, list] = {}
     for p in db.publications("youtube"):
         by_acc.setdefault(p["account_id"], []).append(p)

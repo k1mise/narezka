@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import re
 from pathlib import Path
 
 from .base import Publisher
@@ -13,6 +14,15 @@ SCOPES = [UPLOAD_SCOPE, READONLY_SCOPE]
 
 class ScopeError(RuntimeError):
     """Токен выдан до появления доступа на чтение статистики: нужно один раз войти в YouTube заново."""
+
+
+def iso_duration(text: str) -> float:
+    """'PT1M5S' -> 65.0 (длительность из contentDetails.duration)."""
+    m = re.fullmatch(r"P(?:(\d+)D)?T?(?:(\d+)H)?(?:(\d+)M)?(?:(\d+(?:\.\d+)?)S)?", text or "")
+    if not m:
+        return 0.0
+    d, h, mi, sec = (float(x) if x else 0.0 for x in m.groups())
+    return d * 86400 + h * 3600 + mi * 60 + sec
 
 
 class YouTubePublisher(Publisher):
@@ -90,17 +100,40 @@ class YouTubePublisher(Publisher):
         svc = build("youtube", "v3", credentials=creds, cache_discovery=False)
         out: dict[str, dict] = {}
         for i in range(0, len(video_ids), 50):
-            r = svc.videos().list(part="snippet,statistics,status", id=",".join(video_ids[i:i + 50])).execute()
+            r = svc.videos().list(part="snippet,statistics,status,contentDetails", id=",".join(video_ids[i:i + 50])).execute()
             for it in r.get("items", []):
                 st, status, sn = it.get("statistics", {}), it.get("status", {}), it.get("snippet", {})
                 out[it["id"]] = {
                     "title": sn.get("title", ""), "published": sn.get("publishedAt", ""),
                     "views": int(st.get("viewCount", 0)), "likes": int(st.get("likeCount", 0)),
                     "comments": int(st.get("commentCount", 0)),
-                    "privacy": status.get("privacyStatus", ""), "publish_at": status.get("publishAt", "")}
+                    "privacy": status.get("privacyStatus", ""), "publish_at": status.get("publishAt", ""),
+                    "duration": iso_duration(it.get("contentDetails", {}).get("duration", ""))}
         for vid in video_ids:
-            out.setdefault(vid, {"title": "", "published": "", "views": None, "likes": None, "comments": None, "privacy": "deleted", "publish_at": ""})
+            out.setdefault(vid, {"title": "", "published": "", "views": None, "likes": None, "comments": None, "privacy": "deleted", "publish_at": "", "duration": 0.0})
         return out
+
+    def list_uploads(self, account_id: int, limit: int = 200) -> list[str]:
+        """ID последних видео канала (плейлист «Загрузки», включая закрытые и отложенные). Квота: ~1 единица на 50 видео."""
+        creds = self._creds(account_id)
+        if not creds.has_scopes([READONLY_SCOPE]):
+            raise ScopeError("Чтобы найти все видео канала, нужно один раз заново войти в YouTube (кнопка «Войти в YouTube»).")
+        from googleapiclient.discovery import build
+
+        svc = build("youtube", "v3", credentials=creds, cache_discovery=False)
+        ch = svc.channels().list(part="contentDetails", mine=True).execute().get("items", [])
+        if not ch:
+            return []
+        playlist = ch[0]["contentDetails"]["relatedPlaylists"]["uploads"]
+        ids: list[str] = []
+        token = None
+        while len(ids) < limit:
+            r = svc.playlistItems().list(part="contentDetails", playlistId=playlist, maxResults=50, pageToken=token).execute()
+            ids += [it["contentDetails"]["videoId"] for it in r.get("items", [])]
+            token = r.get("nextPageToken")
+            if not token:
+                break
+        return ids[:limit]
 
     # --- загрузка ---
     def build_body(self, title: str, description: str, publish_at=None, tags: list[str] | None = None) -> dict:
@@ -126,5 +159,5 @@ class YouTubePublisher(Publisher):
                                   media_body=media)
         resp = None
         while resp is None:
-            _, resp = req.next_chunk()
+            _, resp = req.next_chunk(num_retries=5)  # временные сбои сети/сервера (5xx) не должны обрывать загрузку
         return f"https://youtube.com/shorts/{resp['id']}"

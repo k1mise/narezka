@@ -527,3 +527,40 @@ def test_subprocess_text_calls_force_utf8():
                 bad.append(f"{p.name}: {call[:60]}")
     assert not bad, bad
 
+
+
+def test_sync_channels_adds_missing_shorts_only(tmp_path):
+    from narez.history import sync_channels
+    db = make_db(tmp_path)
+    cfg = load_config(); cfg["paths"]["workdir"] = tmp_path
+    g1, g2 = db.add_group("A"), db.add_group("B")
+    db.set_account(g1, "youtube", "yt1"); db.set_account(g2, "youtube", "yt2"); db.set_account(g2, "tiktok", "tt")
+    a1 = next(a["id"] for a in db.accounts(g1)); a2 = next(a["id"] for a in db.accounts(g2) if a["platform"] == "youtube")
+    db.add_publication(None, a1, g1, "youtube", "https://youtube.com/shorts/KNOWNKNOWN1", "уже есть")
+
+    class Pub:
+        def list_uploads(self, acc, limit):
+            if acc == a2:
+                raise RuntimeError("нет токена")
+            assert limit == 200
+            return ["KNOWNKNOWN1", "NEWSHORT001", "LONGVIDEO01", "DELETED0001"]
+
+        def fetch_stats(self, acc, ids):
+            assert ids == ["NEWSHORT001", "LONGVIDEO01", "DELETED0001"]
+            mk = lambda t, d, pr="public": {"title": t, "published": "2026-10-01T10:00:00Z", "views": 7, "likes": 2, "comments": 1,
+                                             "privacy": pr, "publish_at": "", "duration": d}
+            return {"NEWSHORT001": mk("Новый шортс", 40), "LONGVIDEO01": mk("Длинное", 900), "DELETED0001": mk("", 0, "deleted")}
+    logs = []
+    assert sync_channels(db, cfg, Pub(), logs.append, thumb_fn=lambda *a, **k: None) == 1
+    rows = {r["video_id"]: r for r in db.publications()}
+    assert set(rows) == {"KNOWNKNOWN1", "NEWSHORT001"}                      # длинное видео и удалённое не добавлены
+    assert rows["NEWSHORT001"]["group_id"] == g1 and rows["NEWSHORT001"]["views"] == 7 and rows["NEWSHORT001"]["title"] == "Новый шортс"
+    assert any("не удалось получить список" in x for x in logs) and any("добавлено 1" in x for x in logs)
+    cfg["history"] = {"sync_channel": False}
+    assert sync_channels(db, cfg, Pub(), logs.append) == 0                  # можно отключить в config.toml
+    assert sync_channels(db, load_config(), object(), logs.append) == 0     # у публикатора нет list_uploads — молча пропускаем
+
+
+def test_iso_duration():
+    from narez.publishers.youtube import iso_duration
+    assert iso_duration("PT1M5S") == 65 and iso_duration("PT45S") == 45 and iso_duration("PT3M") == 180 and iso_duration("") == 0
