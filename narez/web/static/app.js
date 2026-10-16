@@ -987,7 +987,7 @@ async function pagePresets(page) {
           ...S.banners.map(x => h("option", {value: x.name}, `${x.name} · ${x.kind === "video" ? x.duration + " с" : "картинка"}`))]);
         file.value = sp.name;
         file.onchange = () => { const nb = S.banners.find(x => x.name === file.value); if (nb) { p.banners[idx] = fresh(nb); drawBanners(); } };
-        const up = h("label", {class: "btn sm"}, "+ файл", h("input", {type: "file", hidden: true, accept: "image/*,video/*", onchange: async e => {
+        const up = h("label", {class: "btn sm", title: "Заменить этот баннер другим файлом с компьютера"}, "Другой файл…", h("input", {type: "file", hidden: true, accept: "image/*,video/*", onchange: async e => {
           const f = e.target.files[0]; if (!f) return; toast("Загружаю баннер…");
           try { const r = await api("PUT", "/api/banners?name=" + encodeURIComponent(f.name), undefined, f); await loadBanners();
             const nb = S.banners.find(x => x.name === r.name) || r; p.banners[idx] = fresh(nb); drawBanners(); } catch (er) { fail(er); } }}));
@@ -1012,11 +1012,19 @@ async function pagePresets(page) {
             h("div", {class: "field"}, h("label", {}, "Положение"), pos),
             num(sp, "margin", "Отступ, px", 10, 0, 800), num(sp, "duck_percent", "Громкость основного, %", 5, 0, 100),
             h("label", {class: "check"}, pause, h("span", {}, "Пауза на баннере"))), chroma);
-      }), h("button", {class: "btn sm", disabled: p.banners.length >= max || !S.banners.length, onclick: () => { p.banners.push(fresh(S.banners[0])); drawBanners(); }},
-        S.banners.length ? "+ Добавить баннер" : "Сначала загрузи баннер: «+ файл» появится после первого баннера"),
-        S.banners.length ? null : h("label", {class: "btn sm", style: {marginLeft: "8px"}}, "Загрузить файл баннера", h("input", {type: "file", hidden: true, accept: "image/*,video/*", onchange: async e => {
-          const f = e.target.files[0]; if (!f) return; toast("Загружаю баннер…");
-          try { await api("PUT", "/api/banners?name=" + encodeURIComponent(f.name), undefined, f); await loadBanners(); p.banners.push(fresh(S.banners[0] && S.banners.find(x => x.name === f.name) || S.banners[0])); drawBanners(); } catch (er) { fail(er); } }}))].filter(Boolean));
+      }), h("div", {class: "row", style: {gap: "8px", marginTop: "4px"}},
+        h("label", {class: "btn sm primary" + (p.banners.length >= max ? " disabled" : ""), title: "Картинка (png, jpg, webp) или видео (mp4, mov, mkv, webm) с компьютера — попадёт в библиотеку баннеров и сразу добавится в пресет"},
+          "+ Загрузить с компьютера", h("input", {type: "file", hidden: true, multiple: true, accept: "image/*,video/*", disabled: p.banners.length >= max, onchange: async e => {
+            const files = [...e.target.files].slice(0, max - p.banners.length); e.target.value = "";
+            if (!files.length) return;
+            toast(files.length > 1 ? `Загружаю баннеры: ${files.length}…` : "Загружаю баннер…");
+            for (const f of files) {
+              try { const r = await api("PUT", "/api/banners?name=" + encodeURIComponent(f.name), undefined, f); await loadBanners();
+                p.banners.push(fresh(S.banners.find(x => x.name === r.name) || r)); } catch (er) { fail(er); }
+            }
+            drawBanners(); }})),
+        S.banners.length ? h("button", {class: "btn sm", disabled: p.banners.length >= max, onclick: () => { p.banners.push(fresh(S.banners[0])); drawBanners(); }}, "+ Из библиотеки") : null,
+        h("span", {class: "muted small"}, `${p.banners.length} из ${max}`))].filter(Boolean));
     };
     drawBanners();
     box.replaceChildren(h("div", {class: "card"}, h("h2", {}, p.id ? "Изменить пресет" : "Новый пресет"),
