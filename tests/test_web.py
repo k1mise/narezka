@@ -506,7 +506,7 @@ def test_cut_params_validation(env, monkeypatch):
     r = c.post("/api/process", json={**base, "mode": "full", "length": 30, "overlap": 4})
     assert r.status_code == 200
     wait_task(c, r.json())
-    assert got == [{"mode": "full", "length": 30.0, "overlap": 4.0, "audio": "ru"}]
+    assert got == [{"mode": "full", "length": 30.0, "overlap": 4.0, "audio": "ru", "adcut_sb": None, "adcut_text": None}]
     assert c.post("/api/process", json={**base, "audio": "de"}).status_code == 400
     wait_task(c, c.post("/api/process", json={**base, "audio": "original"}).json())
     assert got[-1]["audio"] == "original"
@@ -521,6 +521,7 @@ def test_full_mode_pipeline_renders_all_parts(env, tmp_path):
                     "-f", "lavfi", "-i", "sine=frequency=300:duration=20", "-shortest", "-c:v", "libx264", "-pix_fmt", "yuv420p",
                     "-c:a", "aac", str(src)], check=True)
     cfg["subtitles"]["enabled"] = False
+    cfg["adcut"] = {"sponsorblock": False, "text": False}   # без речи и рекламы распознавание не нужно
     cfg["clips"].update(width=270, height=480, preset="ultrafast")
     g = db.add_group("g")
     job, clips = pipeline.run(str(src), cfg, db, g, lambda m: None, mode="full", length=8, overlap=2.5)
@@ -1010,3 +1011,15 @@ def test_history_has_group_id(env):
     db.add_publication(cid, a, g, "youtube", "https://youtu.be/x", "T")
     h = c.get("/api/history").json()
     assert h[0]["group_id"] == g and h[0]["group"] == "A"
+
+
+def test_process_passes_adcut_flags_and_config_defaults(env, monkeypatch):
+    c, cfg, db, _ = env
+    g = db.add_group("g")
+    got = []
+    monkeypatch.setattr("narez.web.server.run_pipeline", lambda *a, **k: (got.append(k), (1, []))[1])
+    assert c.get("/api/config").json()["adcut_text"] is True
+    wait_task(c, c.post("/api/process", json={"url": "https://x.y/v", "group_id": g, "adcut_sb": False, "adcut_text": True}).json())
+    wait_task(c, c.post("/api/process", json={"url": "https://x.y/v", "group_id": g}).json())
+    assert got[0]["adcut_sb"] is False and got[0]["adcut_text"] is True
+    assert got[1]["adcut_sb"] is None and got[1]["adcut_text"] is None      # None = как в config.toml

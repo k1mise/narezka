@@ -4,6 +4,7 @@ import re
 import time
 from pathlib import Path
 
+from . import adcut
 from . import db as dbm
 from .config import folder
 from .downloader import download
@@ -83,7 +84,8 @@ class _Timer:
 
 
 def run(url: str, cfg: dict, db: dbm.DB, group_id: int | None = None, log=print, test: bool = False,
-        mode: str = "moments", length: float = 45.0, overlap: float = 2.5, audio: str = "ru"):
+        mode: str = "moments", length: float = 45.0, overlap: float = 2.5, audio: str = "ru",
+        adcut_sb: bool | None = None, adcut_text: bool | None = None):
     """Ссылка -> скачивание -> транскрипт -> моменты -> готовые вертикальные клипы. Возвращает (job_id, [clips]).
     mode="full": без выбора моментов — всё видео режется подряд на части длиной length с нахлёстом overlap."""
     if mode == "full":
@@ -96,10 +98,24 @@ def run(url: str, cfg: dict, db: dbm.DB, group_id: int | None = None, log=print,
     tm.lap("скачивание")
 
     full = mode == "full"
+    sb, tx = adcut.flags(cfg, adcut_sb, adcut_text)
     if full:
-        # речь нужна только для субтитров; без субтитров распознавание пропускаем (это самый долгий этап)
-        segments = to_sentences(transcribe(video, cfg, log, hint=title)) if cfg["subtitles"]["enabled"] else []
-        tm.lap("распознавание речи")
+        # речь нужна для субтитров и для поиска рекламы; без них распознавание пропускаем (это самый долгий этап)
+        segments = to_sentences(transcribe(video, cfg, log, hint=title)) if (cfg["subtitles"]["enabled"] or tx) else []
+    else:
+        segments = to_sentences(transcribe(video, cfg, log, hint=title))
+        if not segments:
+            raise RuntimeError("В видео не найдено речи — нечего нарезать.")
+    tm.lap("распознавание речи")
+
+    src_video = video
+    if sb or tx:
+        video, segments = adcut.run(video, segments, url, cfg, log, sb=sb, text=tx, title=title)
+        tm.lap("поиск и вырезание рекламы")
+        if not full and not segments:
+            raise RuntimeError("После вырезания рекламы в видео не осталось речи — нечего нарезать.")
+
+    if full:
         total = probe(video)["duration"]
         parts = plan_parts(total, length, overlap)
         credit = f"Источник: {title} {url}".strip() if cfg.get("youtube", {}).get("credit_source", True) else ""
@@ -109,17 +125,15 @@ def run(url: str, cfg: dict, db: dbm.DB, group_id: int | None = None, log=print,
             moments.append(Moment(a, b, title[:90 - len(suffix)].rstrip() + suffix, credit, 0.0))
         log(f"Режу видео целиком: {len(moments)} частей по {length:g} с, нахлёст {overlap:g} с.")
     else:
-        segments = to_sentences(transcribe(video, cfg, log, hint=title))
-        tm.lap("распознавание речи")
-        if not segments:
-            raise RuntimeError("В видео не найдено речи — нечего нарезать.")
         moments = find_moments(segments, cfg, log)
         if not moments:
             raise RuntimeError("Модель не нашла подходящих моментов. Попробуй модель побольше или другое видео.")
         log(f"Выбрано моментов: {len(moments)}")
         tm.lap("выбор моментов (LLM)")
 
-    job_id = db.add_job(group_id, url, title, str(video), test=test)
+    # исходником задания считаем скачанный файл (cleanup заодно уберёт и «.noads»); если он вне рабочей папки — файл без рекламы
+    inside = Path(cfg["paths"]["workdir"]).resolve() in src_video.resolve().parents
+    job_id = db.add_job(group_id, url, title, str(src_video if inside else video), test=test)
     out_dir = folder(cfg, "test" if test else "clips") / f"job{job_id}"
     # баннер на клип накладывается отдельно (его можно поменять в окне редактирования), поэтому при рендере его выключаем
     render_cfg = {**cfg, "banner": {**cfg["banner"], "enabled": False}}

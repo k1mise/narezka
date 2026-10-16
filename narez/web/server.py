@@ -64,6 +64,8 @@ class CutIn(BaseModel):
     length: float = 45.0         # длина части (режим full), секунды
     overlap: float = 2.5         # нахлёст: следующая часть начинается за столько секунд до конца предыдущей
     audio: str = "ru"            # ru = русская дорожка, если у видео есть дубляж; original = оригинал
+    adcut_sb: Optional[bool] = None    # вырезать рекламу по SponsorBlock (None = как в config.toml)
+    adcut_text: Optional[bool] = None  # искать рекламу в тексте (None = как в config.toml)
 
 
 def cut_args(b: CutIn) -> dict:
@@ -76,7 +78,8 @@ def cut_args(b: CutIn) -> dict:
             raise HTTPException(400, "Длина клипа — от 5 до 180 секунд")
         if not 0 <= b.overlap <= min(30, b.length - 5):
             raise HTTPException(400, "Нахлёст — от 0 секунд и не больше длины клипа минус 5 секунд")
-    return {"mode": b.mode, "length": b.length, "overlap": b.overlap, "audio": b.audio}
+    return {"mode": b.mode, "length": b.length, "overlap": b.overlap, "audio": b.audio,
+            "adcut_sb": b.adcut_sb, "adcut_text": b.adcut_text}
 
 
 class ProcessIn(CutIn):
@@ -287,7 +290,9 @@ def create_app(cfg: dict | None = None) -> FastAPI:
 
     @app.get("/api/config")
     def config():
-        return {"llm_model": cfg["llm"]["model"], "delay_minutes": cfg["youtube"].get("delay_minutes", 0),
+        from .. import adcut
+        return {"adcut_sb": adcut.settings(cfg)["sponsorblock"], "adcut_text": adcut.settings(cfg)["text"],
+                "llm_model": cfg["llm"]["model"], "delay_minutes": cfg["youtube"].get("delay_minutes", 0),
                 "privacy": cfg["youtube"].get("privacy"), "min_clip": cfg["clips"]["min_seconds"],
                 "max_clip": cfg["clips"]["max_seconds"], "max_banners": max_banners(), "youtube_privacy": cfg["youtube"].get("privacy", "private"), "min_area_percent": cfg["banner"].get("min_area_percent", 25),
                 "min_ahead_minutes": int(schedule.MIN_AHEAD.total_seconds() // 60), "platforms": PLATFORMS,
