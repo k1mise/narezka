@@ -12,7 +12,7 @@ from .banner import config_spec, probe
 from .editor import find_cut, make_thumb, render_clip
 from .meta import split_hashtags
 from .models import Moment
-from .moments import find_moments, make_metadata
+from .moments import find_moments, make_metadata, scrub
 from .subtitles import make_ass
 from .transcriber import to_sentences, transcribe
 
@@ -118,11 +118,10 @@ def run(url: str, cfg: dict, db: dbm.DB, group_id: int | None = None, log=print,
     if full:
         total = probe(video)["duration"]
         parts = plan_parts(total, length, overlap)
-        credit = f"Источник: {title} {url}".strip() if cfg.get("youtube", {}).get("credit_source", True) else ""
         moments = []
         for i, (a, b) in enumerate(parts, 1):
             suffix = f" — часть {i}/{len(parts)}"
-            moments.append(Moment(a, b, title[:90 - len(suffix)].rstrip() + suffix, credit, 0.0))
+            moments.append(Moment(a, b, title[:90 - len(suffix)].rstrip() + suffix, "", 0.0))
         log(f"Режу видео целиком: {len(moments)} частей по {length:g} с, нахлёст {overlap:g} с.")
     else:
         moments = find_moments(segments, cfg, log)
@@ -156,9 +155,16 @@ def run(url: str, cfg: dict, db: dbm.DB, group_id: int | None = None, log=print,
         tm.lap("субтитры (LLM)")
         out = render_clip(video, rs, re_, out_dir / f"{i:0{width}d} {_slug(m.title)}.mp4", ass, render_cfg)
         tm.lap("рендер клипов (ffmpeg)")
-        if not full:
+        if full:    # части одного видео: заголовок придумывает модель по тексту части, номер части остаётся в конце
+            if segments:
+                suffix = f" — часть {i}/{len(moments)}"
+                t_new, m.reason = make_metadata(m, segments, cfg, title, url)
+                m.title = (t_new or m.title)[:90 - len(suffix)].rstrip() + suffix
+            else:
+                m.reason = scrub(m.reason)
+        else:
             m.title, m.reason = make_metadata(m, segments, cfg, title, url)  # заголовок и описание для публикации
-            tm.lap("заголовки и описания (LLM)")
+        tm.lap("заголовки и описания (LLM)")
         body, tags = split_hashtags(m.reason)  # хэштеги храним отдельно, чтобы их можно было править
         m.reason = body
         thumb = make_thumb(out, workdir / "thumbs" / f"job{job_id}_{i:02d}.png")

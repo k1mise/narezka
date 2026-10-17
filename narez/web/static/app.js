@@ -296,7 +296,7 @@ function pagePanel(page) {
         (() => { const cb = h("input", {type: "checkbox", disabled: c.test, title: c.test ? "Тестовые клипы не публикуются" : "Выбрать для публикации", style: {flex: "none"}});
           cb.checked = S.sel.has(c.id); cb.onchange = () => { cb.checked ? S.sel.add(c.id) : S.sel.delete(c.id); updSel(); }; selCbs.push([cb, c]); return cb; })(),
         h("div", {class: "thumb", style: Object.assign({width: "34px", height: "60px"}, c.has_thumb ? {backgroundImage: `url(/api/clips/${c.id}/thumb)`} : {})}, c.has_thumb ? "" : "нет"),
-        h("div", {class: "t"}, h("b", {}, clipLabel(c)), h("span", {class: "muted small"}, `${Math.round(c.duration)} с${c.test ? " · тест" : ""}${c.banner ? " · баннер" : ""}`)),
+        h("div", {class: "t"}, h("b", {}, clipLabel(c)), h("span", {class: "muted small"}, `${Math.round(c.duration)} с${c.score ? ` · ★ ${c.score}/10` : ""}${c.test ? " · тест" : ""}${c.banner ? " · баннер" : ""}`)),
         h("button", {class: "btn sm", onclick: () => ask("Переименовать клип", "Название, с которым клип будет опубликован", c.title, "Сохранить", async v => {
           try { await api("PATCH", `/api/clips/${c.id}`, {title: v}); await loadClips(); render(); } catch (e) { fail(e); } })}, "Переименовать"),
         h("button", {class: "btn sm", onclick: () => { S.cid = c.id; go("editor"); }}, "Править"),
@@ -491,7 +491,7 @@ function pageEditor(page) {
     h("div", {class: "thumb", style: c.has_thumb ? {backgroundImage: `url(/api/clips/${c.id}/thumb)`} : {}}, c.has_thumb ? "" : "нет"),
     h("div", {class: "info"}, h("b", {}, clipLabel(c)), h("div", {class: "tags"},
       S.groups.length > 1 ? h("span", {class: "badge acc"}, c.group) : null,
-      h("span", {class: "badge"}, Math.round(c.duration) + " с"), c.banner ? h("span", {class: "badge acc"}, "баннер") : null, c.test ? h("span", {class: "badge warn"}, "тест") : null,
+      h("span", {class: "badge"}, Math.round(c.duration) + " с"), c.score ? h("span", {class: "badge ok", title: "Оценка модели: насколько клип цепляет (1–10)"}, "★ " + c.score) : null, c.banner ? h("span", {class: "badge acc"}, "баннер") : null, c.test ? h("span", {class: "badge warn"}, "тест") : null,
       c.publish_at ? h("span", {class: "badge warn"}, fmtLocal(c.publish_at).slice(0, 5) + " " + fmtLocal(c.publish_at).slice(-5)) : null)))));
   const right = h("div", {id: "ed"});
   const listWrap = h("div", {class: "clips"}, h("div", {class: "namemode"}, nameToggle(() => { render(); })), ...list.children);
@@ -1135,7 +1135,7 @@ function pageHistory(page) {
     const when = p => fmtLocal(p.uploaded_at);
     const ret = p => p.avg_pct == null ? "—" : `${Math.round(p.avg_pct)}%`;
     const retFull = p => p.avg_pct == null ? "" : ` · ⏱ ${Math.round(p.avg_pct)}% (${Math.round(p.avg_sec || 0)} с)`;
-    const rowsOf = L => h("table", {class: "htable"}, h("thead", {}, h("tr", {}, ["Видео", "Аккаунт", "Статус", "Просмотры", "Лайки", "Коммент.", "Удержание", "Загружено"].map((t, i) => h("th", {class: i > 2 && i < 7 ? "num" : "", title: i === 6 ? "Средний % ролика, который досматривают зрители, и среднее время просмотра. YouTube отдаёт эти данные с задержкой около суток." : ""}, t)))),
+    const rowsOf = L => h("table", {class: "htable"}, h("thead", {}, h("tr", {}, ["Видео", "Аккаунт", "Статус", "Просмотры", "Лайки", "Коммент.", "Удержание", "Дата на канале"].map((t, i) => h("th", {class: i > 2 && i < 7 ? "num" : "", title: i === 6 ? "Средний % ролика, который досматривают зрители, и среднее время просмотра. YouTube отдаёт эти данные с задержкой около суток." : ""}, t)))),
       h("tbody", {}, L.map(p => h("tr", {class: "link", onclick: () => open(p)},
         h("td", {}, h("div", {class: "hcell"}, thumb(p), h("div", {}, h("b", {}, p.title || "Без названия")))),
         h("td", {}, p.account, h("div", {class: "muted small"}, platName(p.platform))), h("td", {}, st(p)), h("td", {class: "num"}, fmtNum(p.views)), h("td", {class: "num"}, fmtNum(p.likes)),

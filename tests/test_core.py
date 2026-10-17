@@ -188,7 +188,7 @@ def test_make_metadata(monkeypatch):
                                                                 "hashtags": ["gta5", "#лайфхаки", "плохой тег"]})
     t, d = moments.make_metadata(m, segs, cfg, "Исходник", "https://youtu.be/x")
     assert t == "Новый» заголовок".replace("»", "") or t.startswith("Новый")
-    assert "Коротко о главном." in d and "Источник: Исходник https://youtu.be/x" in d
+    assert "Коротко о главном." in d and "Источник" not in d and "Исходник" not in d
     assert "#gta5" in d and "#лайфхаки" in d and "плохой" not in d
     monkeypatch.setattr(moments, "chat_json", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("x")))
     assert moments.make_metadata(m, segs, cfg) == ("старый", "причина")
@@ -633,3 +633,21 @@ def test_refresh_stats_saves_retention_and_survives_missing_scope(tmp_path, monk
     state["scope"] = False
     service.refresh_stats(db, cfg, logs.append)             # без аналитики статистика всё равно обновляется, прошлое удержание остаётся
     assert db.publication(p1)["avg_pct"] == 81.5 and any("Удержание" in x for x in logs)
+
+
+def test_metadata_scrubs_author_mentions(monkeypatch):
+    from narez import moments
+    cfg = load_config()
+    m = Moment(10, 50, "старый", "причина")
+    seen = {}
+
+    def fake(cfg_, system, user):
+        seen["user"] = user
+        return {"title": "Крутой момент @MrBeast", "description": "Рассказ.\nИсточник: канал X https://youtu.be/abc\nАвтор: Вася",
+                "hashtags": ["#тема"]}
+    monkeypatch.setattr(moments, "chat_json", fake)
+    t, d = moments.make_metadata(m, fake_segments(), cfg, "Название исходника", "https://youtu.be/x")
+    assert "Название исходника" not in seen["user"]               # название исходного видео модели не передаётся
+    assert "@" not in t and "MrBeast" not in t
+    assert "Источник" not in d and "Автор" not in d and "http" not in d and "#тема" in d
+    assert moments.scrub("Текст\nSource: x\nhttps://youtube.com/watch?v=1") == "Текст"

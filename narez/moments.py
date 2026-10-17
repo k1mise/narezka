@@ -1,6 +1,8 @@
 """Поиск интересных моментов: LLM предлагает, код проверяет и подгоняет под 30–60 секунд."""
 from __future__ import annotations
 
+import re
+
 from .llm import chat_json
 from .models import Moment, Segment
 
@@ -138,23 +140,35 @@ META = """Ты — автор подписей для YouTube Shorts. Тебе �
 Придумай: 1) title — цепляющий заголовок до 70 символов, без кавычек и без эмодзи; 2) description — 1–2 коротких
 предложения о чём ролик, без воды и без выдуманных фактов; 3) hashtags — 3–5 хэштегов по теме, на языке видео,
 без пробелов внутри. Опирайся только на текст ролика.
+Заголовок придумай сам, коротко и по сути именно этого фрагмента. Нигде (ни в заголовке, ни в описании, ни в хэштегах)
+не упоминай автора, блогера, канал или название исходного видео, не пиши «источник», «автор», ссылки и @-имена.
 Ответь ТОЛЬКО JSON: {{"title":"...","description":"...","hashtags":["#тег1","#тег2"]}}"""
 
 
+_CREDIT = re.compile(r"^\s*(источник|автор|канал|credits?|source|via)\b.*$", re.I | re.M)
+
+
+def scrub(text: str) -> str:
+    """Убирает из заголовка/описания ссылки, @-имена и строки вида «Источник: …» / «Автор: …»."""
+    t = _CREDIT.sub("", text or "")
+    t = re.sub(r"https?://\S+|\b(?:www\.)?(?:youtu\.be|youtube\.com)/\S+|@[\w.\-]+", "", t)
+    t = re.sub(r"[ \t]+\n", "\n", t)
+    return re.sub(r"\n{3,}", "\n\n", t).strip()
+
+
 def make_metadata(m: Moment, sentences: list[Segment], cfg: dict, source_title: str = "", source_url: str = "") -> tuple[str, str]:
-    """Заголовок и описание для публикации. При любой ошибке остаются исходные title и reason."""
+    """Заголовок и описание для публикации: модель придумывает их по тексту самого клипа (название исходного видео ей не дают),
+    упоминаний автора и источника нет. При любой ошибке остаются исходные title и reason (тоже очищенные)."""
     try:
         text = " ".join(s.text for s in sentences if s.start >= m.start - 0.05 and s.end <= m.end + 0.5)
-        data = chat_json(cfg, META, f"Название исходного видео: {source_title}\nТекст ролика: {text[:3500]}")
-        title = str(data.get("title", "")).strip().strip('"«»')[:90] or m.title
-        desc = str(data.get("description", "")).strip()
+        if not text.strip():
+            raise ValueError("нет текста клипа")
+        data = chat_json(cfg, META, f"Текст ролика: {text[:3500]}")
+        title = scrub(str(data.get("title", "")).strip().strip('"«»'))[:90] or scrub(m.title)
+        desc = scrub(str(data.get("description", "")).strip())
         tags = " ".join(t if t.startswith("#") else f"#{t}" for t in data.get("hashtags", [])[:5]
                         if isinstance(t, str) and t.strip() and " " not in t.strip())
-        parts = [desc] if desc else []
-        if cfg.get("youtube", {}).get("credit_source", True) and (source_title or source_url):
-            parts.append(f"Источник: {source_title} {source_url}".strip())
-        if tags:
-            parts.append(tags)
+        parts = [p for p in (desc, tags) if p]
         return title, "\n\n".join(parts)
     except Exception:
-        return m.title, m.reason
+        return scrub(m.title), scrub(m.reason)

@@ -234,6 +234,7 @@ def create_app(cfg: dict | None = None) -> FastAPI:
         job = d.job(c["job_id"])
         return {"id": c["id"], "job_id": c["job_id"], "title": c["title"] or "", "description": c["reason"] or "",
                 "tags": c["tags"] or "", "duration": round((c["end"] or 0) - (c["start"] or 0), 1),
+                "score": round(c["score"], 1) if c["score"] else None,
                 "banners": banners_json(c["banner"]),
                 "banner": (banners_json(c["banner"]) or [None])[0], "publish_at": c["publish_at"] or "",
                 "has_file": bool(c["path"]) and Path(c["path"]).exists(),
@@ -1188,10 +1189,11 @@ def create_app(cfg: dict | None = None) -> FastAPI:
     def history(d: DB = Depends(get_db)):
         out = []
         for p in d.publications():
-            up = (p["uploaded_at"] or "").replace(" ", "T")
+            # дата на канале: время выхода (у отложенных — назначенное), а не момент отправки из приложения
+            up = (p["publish_at"] or p["uploaded_at"] or "").replace(" ", "T")
             out.append({"id": p["id"], "title": p["title"], "group": p["group_name"] or "", "group_id": p["group_id"],
                         "account": p["account_label"] or p["platform"], "platform": p["platform"], "url": p["url"],
-                        "status": service.pub_status(p), "uploaded_at": up + "Z" if up and "Z" not in up else up,
+                        "status": service.pub_status(p), "uploaded_at": up + "Z" if up and not re.search(r"(Z|[+-]\d\d:?\d\d)$", up) else up,
                         "publish_at": p["publish_at"] or "", "views": p["views"], "likes": p["likes"],
                         "comments": p["comments"], "avg_pct": p["avg_pct"], "avg_sec": p["avg_sec"], "has_thumb": bool(p["thumb"]) and Path(p["thumb"]).exists()})
         return out
