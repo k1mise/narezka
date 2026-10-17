@@ -1159,7 +1159,9 @@ def create_app(cfg: dict | None = None) -> FastAPI:
         while True:
             time.sleep(30)
             # раз в 20 минут тихо обновляем статистику YouTube (1 ед. квоты на 50 видео), чтобы история не была пустой
-            if time.time() - stats_last["t"] > 20 * 60 and not tasks.running("publish", "stats"):
+            # а если у запланированного видео время выхода уже прошло — не раньше чем через 3 минуты, чтобы статус сменился на «Опубликовано»
+            if not tasks.running("publish", "stats") and (time.time() - stats_last["t"] > 20 * 60 or (
+                    time.time() - stats_last["t"] > 3 * 60 and service.has_stale_scheduled(DB(cfg["paths"]["db"], init=False)))):
                 stats_last["t"] = time.time()
                 try:
                     db_s = DB(cfg["paths"]["db"], init=False)
@@ -1191,7 +1193,7 @@ def create_app(cfg: dict | None = None) -> FastAPI:
                         "account": p["account_label"] or p["platform"], "platform": p["platform"], "url": p["url"],
                         "status": service.pub_status(p), "uploaded_at": up + "Z" if up and "Z" not in up else up,
                         "publish_at": p["publish_at"] or "", "views": p["views"], "likes": p["likes"],
-                        "comments": p["comments"], "has_thumb": bool(p["thumb"]) and Path(p["thumb"]).exists()})
+                        "comments": p["comments"], "avg_pct": p["avg_pct"], "avg_sec": p["avg_sec"], "has_thumb": bool(p["thumb"]) and Path(p["thumb"]).exists()})
         return out
 
     @app.get("/api/history/{pub_id}/thumb")

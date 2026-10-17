@@ -139,6 +139,16 @@ def pub_status(p) -> str:
     return "Закрытое" if priv == "private" else "Загружено"
 
 
+def has_stale_scheduled(db) -> bool:
+    """Есть ли видео YouTube, у которых время выхода уже прошло, а в базе всё ещё «закрытое»: статус пора перечитать."""
+    now = dt.datetime.now(dt.timezone.utc)
+    for p in db.publications("youtube"):
+        at = schedule.from_iso(p["publish_at"] or "")
+        if at and at <= now and (p["privacy"] or "") == "private":
+            return True
+    return False
+
+
 def refresh_stats(db, cfg: dict, log=print) -> int:
     """Обновляет просмотры/лайки/комментарии и статус всех видео истории (videos.list: 1 ед. квоты на 50 видео).
     Возвращает число обновлённых видео. Если нужен повторный вход в YouTube — бросает ScopeError."""
@@ -155,5 +165,12 @@ def refresh_stats(db, cfg: dict, log=print) -> int:
             s = stats[p["video_id"]]
             db.update_stats(p["id"], s["views"], s["likes"], s["comments"], s["privacy"], s["publish_at"] or None)
             n += 1
+        try:    # удержание: не критично — нет права/API/данных, просто остаётся пустым
+            ret = pub.fetch_retention(acc, [p["video_id"] for p in items])
+            for p in items:
+                if p["video_id"] in ret:
+                    db.update_retention(p["id"], *ret[p["video_id"]])
+        except Exception as e:  # noqa: BLE001
+            log(f"Удержание зрителей пропущено: {str(e)[:160]}")
     log(f"Статистика обновлена: {n} видео.")
     return n

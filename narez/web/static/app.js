@@ -1111,8 +1111,8 @@ function pageHistory(page) {
     api("POST", "/api/history/refresh").then(() => setTimeout(async () => { try { await loadHistory(); if (S.page === "history") render(); } catch (e) {} }, 4000)).catch(() => {});
   }
   S.histSort = S.histSort || "date";
-  const sortSeg = h("div", {class: "seg"}, [["date", "По дате загрузки"], ["views", "По просмотрам"]].map(([k, t]) =>
-    h("button", {class: S.histSort === k ? "on" : "", onclick: () => { S.histSort = k; sortSeg.querySelectorAll("button").forEach((b, i) => b.classList.toggle("on", i === (k === "date" ? 0 : 1))); draw(); }}, t)));
+  const sortSeg = h("div", {class: "seg"}, [["date", "По дате загрузки"], ["views", "По просмотрам"], ["ret", "По удержанию"]].map(([k, t]) =>
+    h("button", {class: S.histSort === k ? "on" : "", onclick: () => { S.histSort = k; sortSeg.querySelectorAll("button").forEach((b, i) => b.classList.toggle("on", i === ["date", "views", "ret"].indexOf(k))); draw(); }}, t)));
   bar.append(sortSeg);
   const sched = h("div", {}); page.append(sched);
   const drawSched = async () => {
@@ -1133,18 +1133,20 @@ function pageHistory(page) {
     const thumb = p => h("div", {class: "thumb", style: p.has_thumb ? {backgroundImage: `url(/api/history/${p.id}/thumb)`} : {}}, p.has_thumb ? "" : "нет");
     const st = p => h("span", {class: "badge " + (p.status === "Опубликовано" ? "ok" : p.status === "Удалено" ? "err" : p.status.startsWith("Запл") || p.status.startsWith("В черн") ? "warn" : "")}, p.status);
     const when = p => fmtLocal(p.uploaded_at);
-    const rowsOf = L => h("table", {class: "htable"}, h("thead", {}, h("tr", {}, ["Видео", "Аккаунт", "Статус", "Просмотры", "Лайки", "Коммент.", "Загружено"].map((t, i) => h("th", {class: i > 2 && i < 6 ? "num" : ""}, t)))),
+    const ret = p => p.avg_pct == null ? "—" : `${Math.round(p.avg_pct)}%`;
+    const retFull = p => p.avg_pct == null ? "" : ` · ⏱ ${Math.round(p.avg_pct)}% (${Math.round(p.avg_sec || 0)} с)`;
+    const rowsOf = L => h("table", {class: "htable"}, h("thead", {}, h("tr", {}, ["Видео", "Аккаунт", "Статус", "Просмотры", "Лайки", "Коммент.", "Удержание", "Загружено"].map((t, i) => h("th", {class: i > 2 && i < 7 ? "num" : "", title: i === 6 ? "Средний % ролика, который досматривают зрители, и среднее время просмотра. YouTube отдаёт эти данные с задержкой около суток." : ""}, t)))),
       h("tbody", {}, L.map(p => h("tr", {class: "link", onclick: () => open(p)},
         h("td", {}, h("div", {class: "hcell"}, thumb(p), h("div", {}, h("b", {}, p.title || "Без названия")))),
         h("td", {}, p.account, h("div", {class: "muted small"}, platName(p.platform))), h("td", {}, st(p)), h("td", {class: "num"}, fmtNum(p.views)), h("td", {class: "num"}, fmtNum(p.likes)),
-        h("td", {class: "num"}, fmtNum(p.comments)), h("td", {class: "muted small"}, when(p))))));
+        h("td", {class: "num"}, fmtNum(p.comments)), h("td", {class: "num"}, ret(p)), h("td", {class: "muted small"}, when(p))))));
     const cardsOf = L => h("div", {class: "cards"}, L.map(p => h("div", {class: "card", style: {cursor: "pointer"}, onclick: () => open(p)},
       h("div", {class: "hcell"}, thumb(p), h("div", {}, h("b", {}, p.title || "Без названия"), h("div", {class: "row", style: {gap: "8px", marginTop: "4px"}}, st(p), h("span", {class: "muted small"}, `${platName(p.platform)} · ${p.account}`)),
-        h("div", {class: "muted small", style: {marginTop: "6px"}}, `👁 ${fmtNum(p.views)} · 👍 ${fmtNum(p.likes)} · 💬 ${fmtNum(p.comments)}`))))));
+        h("div", {class: "muted small", style: {marginTop: "6px"}}, `👁 ${fmtNum(p.views)} · 👍 ${fmtNum(p.likes)} · 💬 ${fmtNum(p.comments)}${retFull(p)}`))))));
     // по группам: порядок как в «Аккаунтах», затем остальные (удалённые группы) в конце
     const byG = new Map();
     const ts = p => Date.parse(p.uploaded_at || "") || 0;
-    const cmp = S.histSort === "views" ? (a, b) => (b.views || 0) - (a.views || 0) || ts(b) - ts(a) : (a, b) => ts(b) - ts(a) || b.id - a.id;
+    const cmp = S.histSort === "ret" ? (a, b) => (b.avg_pct ?? -1) - (a.avg_pct ?? -1) || ts(b) - ts(a) : S.histSort === "views" ? (a, b) => (b.views || 0) - (a.views || 0) || ts(b) - ts(a) : (a, b) => ts(b) - ts(a) || b.id - a.id;
     for (const p of [...H].sort(cmp)) { const k = p.group_id || 0; if (!byG.has(k)) byG.set(k, []); byG.get(k).push(p); }
     const order = [...S.groups.map(g => g.id).filter(id => byG.has(id)), ...[...byG.keys()].filter(k => !S.groups.some(g => g.id === k))];
     S.histClosed = S.histClosed || new Set();
@@ -1168,6 +1170,9 @@ function pageHistory(page) {
   };
   if (S.history) draw();
   loadHistory().then(draw).catch(fail);
+  // пока открыта история, список перечитывается из базы раз в минуту (статусы и просмотры обновляет сервер в фоне)
+  clearInterval(S.histTimer);
+  S.histTimer = setInterval(() => { if (S.page !== "history") { clearInterval(S.histTimer); return; } loadHistory().then(draw).catch(() => {}); }, 60e3);
 }
 
 /* ---------- прокси ---------- */

@@ -584,3 +584,52 @@ def test_publication_group_follows_account_not_clip(tmp_path):
         db._migrate(); db2 = db
     rows = {r["account_id"]: r["group_id"] for r in db2.c.execute("SELECT account_id, group_id FROM publications")}
     assert rows[a1] == g1 and rows[999] == g2
+
+
+def test_stale_scheduled_detection(tmp_path):
+    import datetime as dt
+    from narez import service
+    db = make_db(tmp_path)
+    g = db.add_group("g")
+    db.set_account(g, "youtube", "main")
+    acc = db.accounts(g)[0]["id"]
+    j = db.add_job(g, "u", "t")
+    cid = db.add_clip(j, "a.mp4", Moment(0, 40, "T", "D", 5))
+    pid = db.add_publication(cid, acc, g, "youtube", "https://youtube.com/shorts/ABC123", "T", "th.png", "")
+    now = dt.datetime.now(dt.timezone.utc)
+    db.update_stats(pid, 0, 0, 0, "private", (now + dt.timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%S.000Z"))
+    assert not service.has_stale_scheduled(db)          # время выхода ещё впереди
+    db.update_stats(pid, 0, 0, 0, "private", (now - dt.timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%S.000Z"))
+    assert service.has_stale_scheduled(db)              # время прошло, статус не обновлён
+    db.update_stats(pid, 0, 0, 0, "public")
+    assert not service.has_stale_scheduled(db)
+
+
+def test_refresh_stats_saves_retention_and_survives_missing_scope(tmp_path, monkeypatch):
+    from narez import service
+    from narez.config import load_config
+    db = make_db(tmp_path)
+    g = db.add_group("g")
+    db.set_account(g, "youtube", "main")
+    acc = db.accounts(g)[0]["id"]
+    p1 = db.add_publication(None, acc, g, "youtube", "https://youtube.com/shorts/AAAAAAAAAAA", "t")
+    cfg = load_config(); cfg["paths"]["workdir"] = tmp_path
+    state = {"scope": True}
+
+    class Pub:
+        def fetch_stats(self, a, ids):
+            return {i: {"title": "t", "published": "", "views": 5, "likes": 1, "comments": 0, "privacy": "public", "publish_at": "", "duration": 30} for i in ids}
+
+        def fetch_retention(self, a, ids):
+            if not state["scope"]:
+                raise RuntimeError("нет права")
+            return {"AAAAAAAAAAA": (81.5, 24.0)}
+    monkeypatch.setattr(service, "get_publisher", lambda name, cfg: Pub())
+    monkeypatch.setattr("narez.history.sync_channels", lambda *a, **k: 0)
+    logs = []
+    service.refresh_stats(db, cfg, logs.append)
+    row = db.publication(p1)
+    assert row["avg_pct"] == 81.5 and row["avg_sec"] == 24.0 and row["views"] == 5
+    state["scope"] = False
+    service.refresh_stats(db, cfg, logs.append)             # без аналитики статистика всё равно обновляется, прошлое удержание остаётся
+    assert db.publication(p1)["avg_pct"] == 81.5 and any("Удержание" in x for x in logs)

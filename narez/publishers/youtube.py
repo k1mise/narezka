@@ -9,7 +9,8 @@ from .base import Publisher
 
 UPLOAD_SCOPE = "https://www.googleapis.com/auth/youtube.upload"
 READONLY_SCOPE = "https://www.googleapis.com/auth/youtube.readonly"  # для статистики (videos.list, 1 ед. квоты на 50 видео)
-SCOPES = [UPLOAD_SCOPE, READONLY_SCOPE]
+ANALYTICS_SCOPE = "https://www.googleapis.com/auth/yt-analytics.readonly"  # удержание зрителей (YouTube Analytics API)
+SCOPES = [UPLOAD_SCOPE, READONLY_SCOPE, ANALYTICS_SCOPE]
 
 
 class ScopeError(RuntimeError):
@@ -111,6 +112,29 @@ class YouTubePublisher(Publisher):
                     "duration": iso_duration(it.get("contentDetails", {}).get("duration", ""))}
         for vid in video_ids:
             out.setdefault(vid, {"title": "", "published": "", "views": None, "likes": None, "comments": None, "privacy": "deleted", "publish_at": "", "duration": 0.0})
+        return out
+
+    def fetch_retention(self, account_id: int, video_ids: list[str]) -> dict[str, tuple[float, float]]:
+        """{video_id: (средний % досмотра, средняя длительность просмотра в сек.)} из YouTube Analytics.
+        Без права на аналитику (старый вход) бросает ScopeError — вызывающий код это перехватывает, статистика не ломается.
+        Данные приходят с задержкой около суток: у свежих видео их ещё нет."""
+        if not video_ids:
+            return {}
+        creds = self._creds(account_id)
+        if not creds.has_scopes([ANALYTICS_SCOPE]):
+            raise ScopeError("для удержания зрителей войди в YouTube заново (кнопка «Войти в YouTube») и подтверди доступ к аналитике")
+        from googleapiclient.discovery import build
+
+        svc = build("youtubeAnalytics", "v2", credentials=creds, cache_discovery=False)
+        out: dict[str, tuple[float, float]] = {}
+        today = dt.date.today().isoformat()
+        for i in range(0, len(video_ids), 200):
+            chunk = video_ids[i:i + 200]
+            r = svc.reports().query(ids="channel==MINE", startDate="2020-01-01", endDate=today,
+                                    metrics="views,averageViewPercentage,averageViewDuration", dimensions="video",
+                                    filters="video==" + ",".join(chunk), sort="-views", maxResults=200).execute()
+            for row in r.get("rows", []):
+                out[row[0]] = (float(row[2]), float(row[3]))
         return out
 
     def list_uploads(self, account_id: int, limit: int = 200) -> list[str]:

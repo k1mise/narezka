@@ -41,6 +41,7 @@ MIGRATIONS = {
     "jobs": {"source_path": "TEXT DEFAULT ''", "test": "INTEGER DEFAULT 0"},
     "clips": {"group_id": "INTEGER", "tags": "TEXT DEFAULT ''", "banner": "TEXT DEFAULT ''", "banner_applied": "TEXT DEFAULT ''",
               "final_path": "TEXT DEFAULT ''", "thumb": "TEXT DEFAULT ''", "publish_at": "TEXT DEFAULT ''"},
+    "publications": {"avg_pct": "REAL", "avg_sec": "REAL"},    # удержание: средний % досмотра и средняя длительность просмотра (YouTube Analytics)
 }
 CLIP_FIELDS = {"group_id", "path", "title", "reason", "tags", "banner", "banner_applied", "final_path", "thumb", "status", "publish_at"}
 
@@ -315,6 +316,10 @@ class DB:
             q += " WHERE p.platform=?"
             args = (platform,)
         return self.c.execute(q + " ORDER BY p.id DESC", args).fetchall()
+
+    def update_retention(self, pub_id: int, avg_pct: float | None, avg_sec: float | None):
+        self.c.execute("UPDATE publications SET avg_pct=?, avg_sec=? WHERE id=?", (avg_pct, avg_sec, pub_id))
+        self.c.commit()
 
     def update_stats(self, pub_id: int, views: int | None, likes: int | None, comments: int | None,
                      privacy: str, publish_at: str | None = None):
