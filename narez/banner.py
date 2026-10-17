@@ -431,6 +431,42 @@ def apply_banners(base: Path, out: Path, specs: list[dict], cfg: dict, log=print
 
 def ensure_final(db, clip, cfg: dict, log=print) -> Path:
     """Файл клипа для публикации: с баннером (собирается при необходимости) или исходный клип без баннера."""
+    from . import filler
+    if not filler.normalize(clip["filler"]):
+        return _ensure_banner(db, clip, cfg, log)
+    comp = filler.apply_to_clip(db, clip, cfg, log)           # кадр «клип + вставка + название»; баннеры ложатся поверх готового кадра
+    clip = db.clip(clip["id"]) or clip
+    specs = specs_from_json(clip["banner"])
+    if not specs:
+        return comp
+    marker = f"{clip['banner']}|F|{clip['filler_applied']}"
+    out = Path(clip["path"]).with_name(Path(clip["path"]).stem + ".ff.mp4")
+    if clip["final_path"] and Path(clip["final_path"]) == out and out.exists() and clip["banner_applied"] == marker:
+        return out
+    log("Накладываю баннер..." if len(specs) == 1 else f"Накладываю баннеры: {len(specs)}...")
+    apply_banners(comp, out, specs, cfg, log)
+    db.update_clip(clip["id"], final_path=str(out), banner_applied=marker)
+    return out
+
+
+def cached_final(clip, cfg: dict) -> Path | None:
+    """Актуальный готовый файл клипа для предпросмотра (с баннером и/или вставкой) или None."""
+    from . import filler
+    if not clip["path"]:
+        return None
+    if filler.normalize(clip["filler"]):
+        comp = filler.cached(clip, cfg)
+        if not comp:
+            return None
+        if not specs_from_json(clip["banner"]):
+            return comp
+        fin = Path(clip["final_path"]) if clip["final_path"] else None
+        return fin if fin and fin.exists() and clip["banner_applied"] == f"{clip['banner']}|F|{clip['filler_applied']}" else None
+    fin = Path(clip["final_path"]) if clip["final_path"] else None
+    return fin if fin and fin.exists() and specs_from_json(clip["banner"]) and clip["banner_applied"] == clip["banner"] else None
+
+
+def _ensure_banner(db, clip, cfg: dict, log=print) -> Path:
     base = Path(clip["path"])
     specs = specs_from_json(clip["banner"])
     if not specs:

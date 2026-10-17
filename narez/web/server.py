@@ -18,6 +18,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from .. import banner as bn
+from .. import filler as filler_mod
 from .. import schedule, service
 from ..cleanup import discard_clip
 from ..config import FOLDER_TITLES, folder, load_config
@@ -144,6 +145,7 @@ class ClipPatch(BaseModel):
     tags: Optional[str] = None
     banner: Optional[dict] = None
     banners: Optional[list[dict]] = None
+    filler: Optional[dict] = None             # {"position": "top"|"bottom"|"" (без вставки), "file": "" (случайное) | имя файла}
     publish_at: Optional[str] = None
     group_id: Optional[int] = None
 
@@ -160,6 +162,7 @@ class BatchPublishIn(BaseModel):
     start: str = ""                          # время выхода первого клипа (ISO UTC); пусто = сразу
     interval_minutes: float = 0              # промежуток между выходами; 0 = все сразу
     account_ids: Optional[list[int]] = None  # None = все аккаунты группы каждого клипа
+    filler: Optional[dict] = None            # видео-вставка для всех клипов пачки: {"position": "top"|"bottom"|"" (убрать), "file": ""}; не задано = как в клипах
     privacy: str = ""                        # видимость YouTube для клипов, которые выходят сразу: public/unlisted/private; пусто = из config.toml
 
 
@@ -230,11 +233,18 @@ def create_app(cfg: dict | None = None) -> FastAPI:
             out.append(bn.normalize_spec({**r, "path": str(lib[name])}, cfg))
         return out
 
+    def filler_json(raw) -> str:
+        spec = filler_mod.normalize({"position": (raw or {}).get("position"), "file": (raw or {}).get("file")}) if raw else None
+        if spec and spec["file"] and spec["file"] not in {p.name for p in filler_mod.library(cfg)}:
+            raise HTTPException(400, "Такого видео нет в папке вставок")
+        return json.dumps(spec, ensure_ascii=False) if spec else ""
+
     def clip_json(c, d: DB) -> dict:
         job = d.job(c["job_id"])
         return {"id": c["id"], "job_id": c["job_id"], "title": c["title"] or "", "description": c["reason"] or "",
                 "tags": c["tags"] or "", "duration": round((c["end"] or 0) - (c["start"] or 0), 1),
                 "score": round(c["score"], 1) if c["score"] else None,
+                "filler": filler_mod.normalize(c["filler"]),
                 "banners": banners_json(c["banner"]),
                 "banner": (banners_json(c["banner"]) or [None])[0], "publish_at": c["publish_at"] or "",
                 "has_file": bool(c["path"]) and Path(c["path"]).exists(),
@@ -497,6 +507,8 @@ def create_app(cfg: dict | None = None) -> FastAPI:
         if "banners" in sent or "banner" in sent:
             raw = body.banners if "banners" in sent else ([body.banner] if body.banner else [])
             upd["banner"] = bn.specs_to_json(clean_specs(raw))
+        if "filler" in sent:
+            upd["filler"] = filler_json(body.filler)
         if "group_id" in sent and body.group_id is not None:
             need_group(d, body.group_id)
             upd["group_id"] = body.group_id
@@ -524,8 +536,8 @@ def create_app(cfg: dict | None = None) -> FastAPI:
     def clip_video(clip_id: int, variant: str = "base", d: DB = Depends(get_db)):
         c = need_clip(d, clip_id)
         path = c["path"]
-        if variant == "final" and c["final_path"] and c["banner_applied"] == c["banner"]:
-            path = c["final_path"]
+        if variant == "final":
+            path = str(bn.cached_final(c, cfg) or path)
         if not path or not Path(path).exists():
             raise HTTPException(404, "Файл клипа не найден")
         return FileResponse(path, media_type="video/mp4", headers={"Cache-Control": "no-store"})
@@ -547,14 +559,14 @@ def create_app(cfg: dict | None = None) -> FastAPI:
     @app.post("/api/clips/{clip_id}/preview")
     def clip_preview(clip_id: int, d: DB = Depends(get_db)):
         c = need_clip(d, clip_id)
-        if not bn.specs_from_json(c["banner"]):
-            raise HTTPException(400, "У клипа нет баннера")
+        if not bn.specs_from_json(c["banner"]) and not filler_mod.normalize(c["filler"]):
+            raise HTTPException(400, "У клипа нет ни баннера, ни видео-вставки")
 
         def fn(log):
             db2 = DB(cfg["paths"]["db"], init=False)
             bn.ensure_final(db2, db2.clip(clip_id), cfg, log)
             log("Готово.")
-        return started("preview", "Предпросмотр с баннером", fn)
+        return started("preview", "Предпросмотр с баннером и вставкой", fn)
 
     # ---------- прокси ----------
     def proxy_json(r) -> dict:
@@ -791,6 +803,7 @@ def create_app(cfg: dict | None = None) -> FastAPI:
                 src, th = Path(c["path"]), Path(c["thumb"]) if c["thumb"] else None
                 dst = src.with_name(f"{src.stem}_g{gid}{src.suffix}")
                 shutil.copy2(src, dst)
+                filler_mod.copy_sidecar(src, dst)
                 tdst = ""
                 if th and th.exists():
                     t2 = th.with_name(f"{th.stem}_g{gid}{th.suffix}")
@@ -849,12 +862,12 @@ def create_app(cfg: dict | None = None) -> FastAPI:
         if tasks.running("process", "publish"):
             raise HTTPException(409, "Идёт нарезка или публикация — удалять файлы сейчас нельзя, дождись завершения")
         rp = str(p.resolve())
-        for r in d.c.execute("SELECT id, path, final_path FROM clips WHERE status='ready'").fetchall():
+        for r in d.c.execute("SELECT id, path, final_path, filler_path FROM clips WHERE status='ready'").fetchall():
             if r["path"] and str(Path(r["path"]).resolve()) == rp:
-                for extra in (r["final_path"],):
+                for extra in (r["final_path"], r["filler_path"]):
                     if extra:
                         Path(extra).unlink(missing_ok=True)
-                d.update_clip(r["id"], status="discarded", path="", final_path="")
+                d.update_clip(r["id"], status="discarded", path="", final_path="", filler_path="")
         for j in d.c.execute("SELECT id FROM jobs WHERE source_path!=''").fetchall():
             if str(Path(d.job(j["id"])["source_path"]).resolve()) == rp:
                 d.clear_source(j["id"])
@@ -892,9 +905,9 @@ def create_app(cfg: dict | None = None) -> FastAPI:
         for src, dst in moves:
             src.rename(dst)
         mp = {str(src.resolve()): str(dst) for src, dst in moves}
-        for r in d.c.execute("SELECT id, path, final_path FROM clips").fetchall():
+        for r in d.c.execute("SELECT id, path, final_path, filler_path FROM clips").fetchall():
             upd = {}
-            for key in ("path", "final_path"):
+            for key in ("path", "final_path", "filler_path"):
                 if r[key] and str(Path(r[key]).resolve()) in mp:
                     upd[key] = mp[str(Path(r[key]).resolve())]
             if upd:
@@ -970,6 +983,58 @@ def create_app(cfg: dict | None = None) -> FastAPI:
                         "duration": round(info["duration"], 1), "width": info["w"], "height": info["h"],
                         "size": p.stat().st_size, "key": key, "box": box})
         return out
+
+    # ---------- видео-вставки (библиотека) ----------
+    @app.get("/api/fillers")
+    def fillers_list():
+        out = []
+        for p in filler_mod.library(cfg):
+            try:
+                info = bn.probe(p)
+            except bn.BannerError:
+                continue
+            out.append({"name": p.name, "duration": round(info["duration"], 1), "width": info["w"], "height": info["h"], "size": p.stat().st_size})
+        return {"dir": str(filler_mod.library_dir(cfg)), "files": out}
+
+    @app.get("/api/fillers/file")
+    def fillers_file(name: str):
+        p = filler_mod.library_dir(cfg) / Path(name).name
+        if p.suffix.lower() not in filler_mod.VIDEO_EXT or not p.is_file():
+            raise HTTPException(404, "Файл не найден")
+        return FileResponse(p, media_type="video/mp4")
+
+    @app.put("/api/fillers")
+    async def fillers_upload(request: Request, name: str):
+        base = re.sub(r"[^\w.\- ]", "_", Path(name).name).strip()
+        if Path(base).suffix.lower() not in filler_mod.VIDEO_EXT:
+            raise HTTPException(400, "Допустимы видео: mp4, mov, mkv, webm, m4v")
+        folder = filler_mod.library_dir(cfg)
+        folder.mkdir(parents=True, exist_ok=True)
+        dest = folder / base
+        tmp = dest.with_suffix(dest.suffix + ".part")
+        size = 0
+        with open(tmp, "wb") as f:
+            async for chunk in request.stream():
+                size += len(chunk)
+                if size > MAX_BANNER_BYTES:
+                    f.close(); tmp.unlink(missing_ok=True)
+                    raise HTTPException(413, "Файл больше 500 МБ")
+                f.write(chunk)
+        tmp.replace(dest)
+        try:
+            info = bn.probe(dest)
+        except bn.BannerError as e:
+            dest.unlink(missing_ok=True)
+            raise HTTPException(400, f"Файл не распознан как видео: {e}") from None
+        return {"name": dest.name, "duration": round(info["duration"], 1)}
+
+    @app.delete("/api/fillers")
+    def fillers_delete(name: str):
+        p = filler_mod.library_dir(cfg) / Path(name).name
+        if not p.is_file() or p.suffix.lower() not in filler_mod.VIDEO_EXT:
+            raise HTTPException(404, "Файл не найден")
+        p.unlink()
+        return {"ok": True}
 
     @app.put("/api/banners")
     async def upload_banner(request: Request, name: str):
@@ -1093,6 +1158,11 @@ def create_app(cfg: dict | None = None) -> FastAPI:
             if a["platform"] not in REAL_PLATFORMS:
                 raise HTTPException(400, f"Публикация на {a['platform']} пока не поддерживается")
             targets.append(i)
+        if body.filler is not None:
+            fj = filler_json(body.filler)
+            for cid in order:
+                if d.clip(cid):
+                    d.update_clip(cid, filler=fj)
         groups: dict[int, list[int]] = {}
         for pos, cid in enumerate(order):
             c = d.clip(cid)

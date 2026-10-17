@@ -12,6 +12,7 @@ from .banner import config_spec, probe
 from .editor import find_cut, make_thumb, render_clip
 from .meta import split_hashtags
 from .models import Moment
+from . import filler as filler_mod
 from .moments import find_moments, make_metadata, scrub
 from .subtitles import make_ass
 from .transcriber import to_sentences, transcribe
@@ -154,6 +155,7 @@ def run(url: str, cfg: dict, db: dbm.DB, group_id: int | None = None, log=print,
         ass = make_ass(segments, rs, re_, sub_cfg, log, topic=title) if cfg["subtitles"]["enabled"] else None
         tm.lap("субтитры (LLM)")
         out = render_clip(video, rs, re_, out_dir / f"{i:0{width}d} {_slug(m.title)}.mp4", ass, render_cfg)
+        filler_mod.write_sidecar(out, video, rs, re_, ass)     # нужно, чтобы позже собрать клип со вставкой прямо из исходника
         tm.lap("рендер клипов (ffmpeg)")
         if full:    # части одного видео: заголовок придумывает модель по тексту части, номер части остаётся в конце
             if segments:

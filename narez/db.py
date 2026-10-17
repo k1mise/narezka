@@ -40,10 +40,11 @@ CREATE TABLE IF NOT EXISTS publications(
 MIGRATIONS = {
     "jobs": {"source_path": "TEXT DEFAULT ''", "test": "INTEGER DEFAULT 0"},
     "clips": {"group_id": "INTEGER", "tags": "TEXT DEFAULT ''", "banner": "TEXT DEFAULT ''", "banner_applied": "TEXT DEFAULT ''",
-              "final_path": "TEXT DEFAULT ''", "thumb": "TEXT DEFAULT ''", "publish_at": "TEXT DEFAULT ''"},
+              "final_path": "TEXT DEFAULT ''", "thumb": "TEXT DEFAULT ''", "publish_at": "TEXT DEFAULT ''",
+              "filler": "TEXT DEFAULT ''", "filler_path": "TEXT DEFAULT ''", "filler_applied": "TEXT DEFAULT ''"},
     "publications": {"avg_pct": "REAL", "avg_sec": "REAL"},    # удержание: средний % досмотра и средняя длительность просмотра (YouTube Analytics)
 }
-CLIP_FIELDS = {"group_id", "path", "title", "reason", "tags", "banner", "banner_applied", "final_path", "thumb", "status", "publish_at"}
+CLIP_FIELDS = {"group_id", "path", "title", "reason", "tags", "banner", "banner_applied", "final_path", "thumb", "status", "publish_at", "filler", "filler_path", "filler_applied"}
 
 
 class DB:

@@ -30,10 +30,13 @@ def _rm(p: Path, workdir: Path) -> int:
 
 def _drop_clip_files(clip, workdir: Path) -> int:
     freed = 0
-    for key in ("path", "final_path"):
+    for key in ("path", "final_path", "filler_path"):
         if clip[key]:
             freed += _rm(Path(clip[key]), workdir)
     base = Path(clip["path"]) if clip["path"] else None
+    if base and _inside(base, workdir):
+        from .filler import drop_sidecar
+        drop_sidecar(base)
     if base and base.parent.exists() and _inside(base.parent, workdir):
         try:
             base.parent.rmdir()  # пустую папку задания убираем, непустую не трогаем
@@ -57,7 +60,7 @@ def discard_clip(db, cfg: dict, clip_id: int) -> None:
     clip = db.clip(clip_id)
     if clip:
         _drop_clip_files(clip, cfg["paths"]["workdir"])
-        db.update_clip(clip_id, status="discarded", path="", final_path="")
+        db.update_clip(clip_id, status="discarded", path="", final_path="", filler_path="")
 
 
 def finish_group(db, cfg: dict, group_id: int, log=print, delete_sources: bool = True,
@@ -80,7 +83,7 @@ def finish_group(db, cfg: dict, group_id: int, log=print, delete_sources: bool =
             continue  # тестовые клипы не трогаем
         if real <= db.clip_published_accounts(clip["id"]):
             freed += _drop_clip_files(clip, workdir)
-            db.update_clip(clip["id"], status="published", path="", final_path="")
+            db.update_clip(clip["id"], status="published", path="", final_path="", filler_path="")
     if delete_sources:
         for job in db.jobs_with_source(None):   # клип мог быть перенесён в другую группу — смотрим исходники всех заданий
             if db.clip_count(job["id"]) > 0 and db.open_clip_count(job["id"]) == 0:

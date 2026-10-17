@@ -10,7 +10,7 @@ const ICONS = {
   presets: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 6h10M18 6h2M4 12h4M12 12h8M4 18h12M20 18h0"/><circle cx="16" cy="6" r="2"/><circle cx="10" cy="12" r="2"/><circle cx="18" cy="18" r="2"/></svg>',
   history: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5M12 7v5l3 2"/></svg>',
 };
-const PAGES = [["panel", "Панель"], ["editor", "Редактор"], ["accounts", "Аккаунты"], ["presets", "Пресеты"], ["templates", "Шаблоны"], ["history", "История"], ["proxies", "Прокси"]];
+const PAGES = [["panel", "Панель"], ["editor", "Редактор"], ["accounts", "Аккаунты"], ["presets", "Пресеты"], ["templates", "Шаблоны"], ["fillers", "Вставки"], ["history", "История"], ["proxies", "Прокси"]];
 const PLAT = {youtube: ["YT", "YouTube Shorts"], tiktok: ["TT", "TikTok"], instagram: ["IG", "Instagram Reels"]};
 
 const S = {
@@ -114,7 +114,7 @@ function renderHealth() {
 function renderGroupPick() {
   const sel = $("#group"); sel.replaceChildren(...S.groups.map(g => h("option", {value: g.id}, g.name)));
   if (S.gid) sel.value = S.gid;
-  $("#group-pick").hidden = !S.groups.length || ["accounts", "history", "proxies", "editor", "templates", "presets"].includes(S.page);
+  $("#group-pick").hidden = !S.groups.length || ["accounts", "history", "proxies", "editor", "templates", "presets", "fillers"].includes(S.page);
 }
 function renderPill() {
   const run = S.tasks.filter(t => t.status === "running");
@@ -132,9 +132,11 @@ function render() {
   $("#title").textContent = PAGES.find(x => x[0] === S.page)[1];
   document.title = $("#title").textContent + " — narez";
   renderNav(); renderGroupPick();
-  const page = $("#page");
-  page.replaceChildren();
-  ({panel: pagePanel, editor: pageEditor, accounts: pageAccounts, history: pageHistory, proxies: pageProxies, templates: pageTemplates, presets: pagePresets})[S.page](page);
+  // каждая отрисовка получает новый контейнер: «асинхронные» страницы (ждущие данные) от прошлой отрисовки дорисовывают
+  // в старый, уже отсоединённый контейнер и не попадают на другую вкладку или в дубль
+  const old = $("#page"), page = old.cloneNode(false);
+  old.replaceWith(page);
+  ({panel: pagePanel, editor: pageEditor, accounts: pageAccounts, history: pageHistory, proxies: pageProxies, templates: pageTemplates, presets: pagePresets, fillers: pageFillers})[S.page](page);
 }
 
 /* ---------- данные ---------- */
@@ -150,6 +152,8 @@ async function loadClips() {
   renderNav();
 }
 async function loadBanners() { S.banners = await api("GET", "/api/banners"); }
+async function loadFillers() { try { S.fillers = await api("GET", "/api/fillers"); } catch (e) { S.fillers = S.fillers || {dir: "", files: []}; } }
+const FILLER_POS = {"": "Без вставки", bottom: "Вставка снизу", top: "Вставка сверху"};
 async function loadTemplates() { try { S.templates = await api("GET", "/api/templates"); } catch (e) { S.templates = S.templates || []; } if (S.tplId && !S.templates.some(t => t.id === S.tplId)) S.tplId = null; }
 async function loadHistory() { S.history = await api("GET", "/api/history"); }
 
@@ -369,6 +373,16 @@ function publishWindow(ids) {
   let savedPriv = ""; try { savedPriv = localStorage.getItem("pubPrivacy") || ""; } catch (e) {}
   privSel.value = savedPriv in PRIV ? savedPriv : "public";   // клипы с временем YouTube всё равно сам откроет публично — первый должен быть таким же
   privSel.addEventListener("change", () => { try { localStorage.setItem("pubPrivacy", privSel.value); } catch (e) {} });
+  const FSEL = [["keep", "Как в редакторе (у каждого клипа своё)"], ["", "Без вставки"], ["bottom", "Вставка снизу (клип сверху)"], ["top", "Вставка сверху (клип снизу)"]];
+  const fillSel = h("select", {}, FSEL.map(([v, t]) => h("option", {value: v}, t)));
+  let savedFill = "keep"; try { savedFill = localStorage.getItem("pubFiller") || "keep"; } catch (e) {}
+  fillSel.value = FSEL.some(x => x[0] === savedFill) ? savedFill : "keep";
+  const fillNote = h("div", {class: "hint"});
+  const fillUpd = () => { try { localStorage.setItem("pubFiller", fillSel.value); } catch (e) {}
+    const n = ((S.fillers && S.fillers.files) || []).length;
+    fillNote.textContent = fillSel.value === "keep" || fillSel.value === "" ? "" : n ? `Для каждого клипа случайно выберется одно из ${n} видео (вкладка «Вставки»). Название клипа напишется в полоске.` : "В папке вставок нет видео — публикация с вставкой не получится. Загрузи ролики во вкладке «Вставки»."; };
+  fillSel.addEventListener("change", fillUpd);
+  if (!S.fillers) loadFillers().then(fillUpd); else fillUpd();
   const intervalMin = () => Math.max(0, Number(amount.value) || 0) * Number(unit.value);
   const startDate = () => startMode.value === "at" && startAt.value ? new Date(startAt.value) : null;
   const whenOf = i => { const iv = intervalMin(), st = startDate();
@@ -387,6 +401,7 @@ function publishWindow(ids) {
         h("div", {class: "t", style: {minWidth: "160px", flex: "1"}}, h("b", {title: clipLabel(c)}, clipLabel(c)),
           h("span", {class: "muted small"}, `${fmtDur(c.duration)} · ` + (g ? `${g.name}: ${g.accounts.map(a => platName(a.platform)).join(", ") || "нет аккаунтов"}` : "без группы"))),
         h("span", {class: "badge " + (nb ? "acc" : "")}, nb ? (nb > 1 ? `баннеры ×${nb}` : "баннер") : "без баннера"),
+        c.filler && c.filler.position ? h("span", {class: "badge acc"}, c.filler.position === "top" ? "вставка ↑" : "вставка ↓") : null,
         h("div", {class: "small", style: {width: "128px", flex: "none", textAlign: "right", color: w ? "var(--text)" : "var(--ok)"}}, w ? fmtLocal(w.toISOString()) : "сразу"),
         mv("▲", i === 0, () => { [order[i - 1], order[i]] = [order[i], order[i - 1]]; draw(); }),
         mv("▼", i === order.length - 1, () => { [order[i + 1], order[i]] = [order[i], order[i + 1]]; draw(); }),
@@ -406,7 +421,7 @@ function publishWindow(ids) {
     if (startMode.value === "at" && (!st || st.getTime() < Date.now() + 5 * 60e3)) return fail1("Время начала должно быть минимум на 5 минут позже текущего.");
     go1.disabled = true;
     try {
-      const t = await api("POST", "/api/publish/batch", {clip_ids: order, start: st ? st.toISOString() : "", interval_minutes: iv, privacy: privSel.value});
+      const t = await api("POST", "/api/publish/batch", {clip_ids: order, start: st ? st.toISOString() : "", interval_minutes: iv, privacy: privSel.value, ...(fillSel.value === "keep" ? {} : {filler: {position: fillSel.value, file: ""}})});
       d.close(); S.sel = new Set(); startTracking(t); toast("Публикую…"); go("panel"); if (S.page === "panel") render();
     } catch (e) { go1.disabled = false; fail1(e.message || String(e)); }
   }}, "Опубликовать");
@@ -418,7 +433,8 @@ function publishWindow(ids) {
     h("div", {class: "row", style: {gap: "10px", flexWrap: "wrap", alignItems: "center", marginBottom: "10px"}}, startMode, startAt),
     h("div", {class: "row", style: {gap: "10px", flexWrap: "wrap", alignItems: "center", marginBottom: "10px"}}, h("b", {}, "YouTube, клипы без времени (выходят сразу):"), privSel,
       h("span", {class: "muted small"}, "Клипы с временем YouTube держит закрытыми и сам открывает публично в назначенный момент.")),
-    hint, err),
+    h("div", {class: "row", style: {gap: "10px", flexWrap: "wrap", alignItems: "center", marginBottom: "4px"}}, h("b", {}, "Видео-вставка:"), fillSel),
+    fillNote, hint, err),
     h("div", {class: "acts"}, h("button", {class: "btn ghost", onclick: () => d.close()}, "Отмена"), go1));
   d.style.width = "min(820px, calc(100vw - 32px))";
   d.addEventListener("close", () => { d.style.width = ""; }, {once: true});
@@ -482,7 +498,25 @@ function filesCard() {
 }
 
 /* ---------- редактор ---------- */
+function fillerCard(c) {
+  const files = (S.fillers && S.fillers.files) || [];
+  const cur = c.filler || {position: "", file: ""};
+  const pos = h("select", {}, Object.entries(FILLER_POS).map(([v, t]) => h("option", {value: v}, t)));
+  const file = h("select", {}, [h("option", {value: ""}, "Случайное видео"), ...files.map(f => h("option", {value: f.name}, f.name))]);
+  pos.value = cur.position || ""; file.value = cur.file || "";
+  const hint = h("div", {class: "hint"});
+  const upd = () => { file.disabled = !pos.value;
+    hint.textContent = !files.length ? "В папке вставок пока нет видео — открой вкладку «Вставки»."
+      : pos.value === "bottom" ? "Клип сверху, под ним полоска с названием, ниже — видео-вставка."
+      : pos.value === "top" ? "Сверху полоска с названием, под ней видео-вставка, клип внизу."
+      : "Клип остаётся на весь экран."; };
+  const send = async () => { upd(); try { await api("PATCH", `/api/clips/${c.id}`, {filler: {position: pos.value, file: file.value}}); await loadClips(); toast("Вставка сохранена"); } catch (e) { fail(e); } };
+  pos.onchange = send; file.onchange = send; upd();
+  return h("div", {class: "card"}, h("h2", {}, "Видео-вставка", h("small", {}, "собирается при публикации; «Точный предпросмотр» покажет результат")),
+    h("div", {class: "field"}, h("label", {}, "Расположение"), pos), h("div", {class: "field"}, h("label", {}, "Какое видео"), file), hint);
+}
 function pageEditor(page) {
+  if (!S.fillers) loadFillers().then(() => { if (S.page === "editor") render(); });
   if (!S.groups.length || !S.clips.length) {
     page.append(h("div", {class: "card empty"}, h("b", {}, "Нет клипов для редактирования"), "Нарежь видео на вкладке «Панель»."));
     return;
@@ -532,7 +566,8 @@ async function buildEditor(root) {
     }
     try {
       await save(true);
-      if (!specsNow().length) return toast("Баннер не выбран", "err");
+      const curClip = S.clips.find(x => x.id === c.id) || c;
+      if (!specsNow().length && !(curClip.filler && curClip.filler.position)) return toast("Ни баннер, ни видео-вставка не выбраны", "err");
       pvBtn.disabled = true; pvBtn.textContent = "Собираю предпросмотр…";
       const t = await api("POST", `/api/clips/${c.id}/preview`); startTracking(t);
       for (;;) {
@@ -882,6 +917,7 @@ async function buildEditor(root) {
       h("div", {class: "field"}, h("label", {}, "Теги"), tags, h("div", {class: "hint"}, "Через пробел, с # или без — программа приведёт к одному виду.")),
       h("div", {class: "muted small"}, `Источник: ${c.source || "—"} · ${Math.round(c.duration)} с`)),
       h("div", {class: "card"}, h("h2", {}, "Баннер", h("small", {}, `минимум ${cfg.min_area_percent}% экрана`)), bnBox),
+      fillerCard(c),
       h("div", {class: "card"}, h("h2", {}, "Пресеты", h("small", {}, "баннер, теги и подпись одним нажатием")),
         h("div", {class: "field"}, presetSel), presetInfo,
         h("div", {class: "sticky-actions"},
@@ -959,6 +995,28 @@ async function cancelLogin() {
 }
 
 /* ---------- пресеты (без клипа) ---------- */
+function pageFillers(page) {
+  const box = h("div", {});
+  page.append(h("div", {class: "note", style: {marginBottom: "16px"}},
+    "Видео-вставки — ролики, которые идут под или над клипом (чистка ковров, песок, чернила…). Перед публикацией программа берёт случайную из этой папки; расположение (сверху или снизу) выбирается в «Редакторе» или в окне публикации. Клип сжимается до ~половины экрана, вставка занимает ~85% оставшегося места, в узкой полоске пишется название клипа."),
+    h("div", {class: "row", style: {marginBottom: "16px"}},
+      h("label", {class: "btn primary"}, "+ Загрузить видео", h("input", {type: "file", hidden: true, multiple: true, accept: "video/*", onchange: async e => {
+        const files = [...e.target.files]; e.target.value = ""; if (!files.length) return;
+        toast(`Загружаю: ${files.length}…`);
+        for (const f of files) { try { await api("PUT", "/api/fillers?name=" + encodeURIComponent(f.name), undefined, f); } catch (er) { fail(er); } }
+        await loadFillers(); draw(); }}))), box);
+  const draw = () => {
+    const F = S.fillers || {dir: "", files: []};
+    box.replaceChildren(h("div", {class: "muted small", style: {marginBottom: "10px"}}, `Папка: ${F.dir} · роликов: ${F.files.length}. Пусто? Запусти get_fillers.py (скачает бесплатные ролики) или загрузи свои.`),
+      h("div", {class: "cards"}, F.files.map(f => h("div", {class: "card"},
+        h("video", {src: "/api/fillers/file?name=" + encodeURIComponent(f.name), muted: true, controls: true, preload: "metadata", style: {width: "100%", maxHeight: "220px", borderRadius: "10px", background: "#000"}}),
+        h("div", {class: "row", style: {marginTop: "8px"}}, h("div", {class: "grow"}, h("b", {}, f.name), h("div", {class: "muted small"}, `${f.width}×${f.height} · ${fmtDur(f.duration)} · ${(f.size / 1048576).toFixed(1)} МБ`)),
+          h("button", {class: "btn sm danger", onclick: () => confirmBox("Удалить видео?", `«${f.name}» будет удалено из папки вставок.`, "Удалить", async () => {
+            try { await api("DELETE", "/api/fillers?name=" + encodeURIComponent(f.name)); await loadFillers(); draw(); } catch (er) { fail(er); } })}, "Удалить"))))));
+  };
+  draw();
+  loadFillers().then(draw);
+}
 async function pagePresets(page) {
   try { S.presets = await api("GET", "/api/presets"); } catch (e) { S.presets = S.presets || []; }
   if (!S.banners.length) { try { await loadBanners(); } catch (e) {} }
