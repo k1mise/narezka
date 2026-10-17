@@ -460,7 +460,7 @@ def create_app(cfg: dict | None = None) -> FastAPI:
 
     @app.get("/api/tasks")
     def task_list():
-        return [t.public() for t in tasks.recent()]
+        return [t.public() for t in tasks.recent(100)]
 
     @app.get("/api/tasks/{task_id}")
     def task_get(task_id: str, after: int = 0):

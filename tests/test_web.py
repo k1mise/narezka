@@ -1039,3 +1039,20 @@ def test_preset_edit_by_id_and_rename(env):
     assert c.post("/api/presets", json={"id": a["id"], "name": "б", "tags": "x"}).status_code == 400   # занято другим пресетом
     assert c.post("/api/presets", json={"id": 999, "name": "Я", "tags": "x"}).status_code == 404
     assert c.post("/api/presets", json={"id": b["id"], "name": "Б"}).status_code == 400                 # пустой пресет
+
+
+def test_task_log_drops_tasks_older_than_7_days(tmp_path):
+    import json
+    import time
+    from narez.web.tasks import TaskManager
+    store = tmp_path / "logs"
+    store.mkdir()
+    now = time.time()
+    for i, age in (("old", 8 * 86400), ("new", 2 * 86400)):
+        (store / f"{i}.json").write_text(json.dumps({"id": i, "kind": "x", "title": i, "status": "done", "started": now - age, "finished": now - age}), encoding="utf-8")
+        (store / f"{i}.log").write_text("log", encoding="utf-8")
+    tm = TaskManager(store=store)
+    assert tm.get("old") is None and tm.get("new") is not None
+    assert not (store / "old.json").exists() and not (store / "old.log").exists()
+    tm.get("new").finished = now - 9 * 86400
+    assert [t.id for t in tm.recent()] == [] and not (store / "new.json").exists()

@@ -304,8 +304,12 @@ function pagePanel(page) {
           try { await api("DELETE", `/api/clips/${c.id}`); await loadClips(); toast("Клип удалён"); render(); } catch (e) { fail(e); } })}, "Удалить"))))]
       : h("div", {class: "muted"}, "Пока пусто — вставь ссылку выше.")));
   updSel();
-  const hist = S.tasks.filter(t => t.status !== "running").slice(0, 15);
-  if (hist.length) page.append(h("div", {class: "card"}, h("h2", {}, "Журнал задач", h("small", {}, "хранится на диске, нажми на задачу — откроется полный лог")), hist.map(t => {
+  const fin = S.tasks.filter(t => t.status !== "running"), dayAgo = Date.now() / 1000 - 86400;
+  const fresh = fin.filter(t => (t.finished || t.started) >= dayAgo), older = fin.filter(t => (t.finished || t.started) < dayAgo);
+  const hist = S.tasksMore ? fin : fresh;
+  if (fin.length) page.append(h("div", {class: "card"}, h("h2", {}, "Журнал задач", h("small", {}, "за последние 24 часа · нажми на задачу — откроется полный лог · записи старше 7 дней удаляются")),
+    hist.length ? null : h("div", {class: "muted small"}, "За последние 24 часа задач не было."),
+    hist.map(t => {
     const r = t.result || {}, warn = t.status === "done" && (r.errors || r.limit || r.left);
     const when = t.started ? new Date(t.started * 1000).toLocaleString("ru-RU", {day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit"}) : "";
     const box = h("pre", {class: "log", style: {display: "none", marginTop: "8px", maxHeight: "320px", overflow: "auto", whiteSpace: "pre-wrap"}});
@@ -318,7 +322,8 @@ function pagePanel(page) {
     }}, h("div", {class: "t"}, h("b", {}, t.title), h("span", {class: "muted small"}, `${when}${sum}${t.status === "error" ? " · " + t.error : ""}`)),
       h("span", {class: "badge " + (t.status === "done" ? (warn ? "warn" : "ok") : "err")}, t.status === "done" ? (warn ? "с замечаниями" : "готово") : "ошибка"));
     return h("div", {}, row, box);
-  })));
+  }), !S.tasksMore && older.length ? h("button", {class: "btn sm", style: {marginTop: "10px"}, onclick: () => { S.tasksMore = true; render(); }}, `Увидеть больше (${older.length})`)
+    : S.tasksMore && older.length ? h("button", {class: "btn sm", style: {marginTop: "10px"}, onclick: () => { S.tasksMore = false; render(); }}, "Свернуть") : null));
   updateRunBox();
 }
 function updateRunBox() {
@@ -1105,6 +1110,10 @@ function pageHistory(page) {
     S.statsAuto = Date.now();
     api("POST", "/api/history/refresh").then(() => setTimeout(async () => { try { await loadHistory(); if (S.page === "history") render(); } catch (e) {} }, 4000)).catch(() => {});
   }
+  S.histSort = S.histSort || "date";
+  const sortSeg = h("div", {class: "seg"}, [["date", "По дате загрузки"], ["views", "По просмотрам"]].map(([k, t]) =>
+    h("button", {class: S.histSort === k ? "on" : "", onclick: () => { S.histSort = k; sortSeg.querySelectorAll("button").forEach((b, i) => b.classList.toggle("on", i === (k === "date" ? 0 : 1))); draw(); }}, t)));
+  bar.append(sortSeg);
   const sched = h("div", {}); page.append(sched);
   const drawSched = async () => {
     let L = []; try { L = await api("GET", "/api/scheduled"); } catch (e) {}
@@ -1134,7 +1143,9 @@ function pageHistory(page) {
         h("div", {class: "muted small", style: {marginTop: "6px"}}, `👁 ${fmtNum(p.views)} · 👍 ${fmtNum(p.likes)} · 💬 ${fmtNum(p.comments)}`))))));
     // по группам: порядок как в «Аккаунтах», затем остальные (удалённые группы) в конце
     const byG = new Map();
-    for (const p of H) { const k = p.group_id || 0; if (!byG.has(k)) byG.set(k, []); byG.get(k).push(p); }
+    const ts = p => Date.parse(p.uploaded_at || "") || 0;
+    const cmp = S.histSort === "views" ? (a, b) => (b.views || 0) - (a.views || 0) || ts(b) - ts(a) : (a, b) => ts(b) - ts(a) || b.id - a.id;
+    for (const p of [...H].sort(cmp)) { const k = p.group_id || 0; if (!byG.has(k)) byG.set(k, []); byG.get(k).push(p); }
     const order = [...S.groups.map(g => g.id).filter(id => byG.has(id)), ...[...byG.keys()].filter(k => !S.groups.some(g => g.id === k))];
     S.histClosed = S.histClosed || new Set();
     const sum = (L, f) => L.reduce((a, p) => a + (p[f] || 0), 0);

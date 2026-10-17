@@ -56,10 +56,11 @@ class Task:
 
 
 class TaskManager:
-    def __init__(self, keep: int = 60, store: Path | None = None):
+    def __init__(self, keep: int = 60, store: Path | None = None, max_age: float = 7 * 86400):
         self._tasks: dict[str, Task] = {}
         self._lock = threading.Lock()
         self.keep = keep
+        self.max_age = max_age       # завершённые задачи старше этого срока удаляются (по умолчанию 7 дней)
         self.store = Path(store) if store else None
         if self.store:
             self.store.mkdir(parents=True, exist_ok=True)
@@ -73,6 +74,12 @@ class TaskManager:
                 metas.append(json.loads(f.read_text(encoding="utf-8")))
             except (OSError, ValueError):
                 continue
+        now = time.time()
+        old = [m for m in metas if m.get("status") != "running" and m.get("finished", 0) and now - m["finished"] > self.max_age]
+        for m in old:
+            for ext in ("json", "log"):
+                (self.store / f"{m.get('id')}.{ext}").unlink(missing_ok=True)
+        metas = [m for m in metas if m not in old]
         metas.sort(key=lambda m: m.get("started", 0))
         for m in metas[:-self.keep]:                         # старые журналы удаляем
             for ext in ("json", "log"):
@@ -125,5 +132,17 @@ class TaskManager:
     def get(self, task_id: str) -> Task | None:
         return self._tasks.get(task_id)
 
+    def purge_old(self) -> None:
+        """Удаляет завершённые задачи (и их логи на диске), которым больше max_age."""
+        now = time.time()
+        with self._lock:
+            for t in list(self._tasks.values()):
+                if t.status != "running" and t.finished and now - t.finished > self.max_age:
+                    self._tasks.pop(t.id, None)
+                    if self.store:
+                        for ext in ("json", "log"):
+                            (self.store / f"{t.id}.{ext}").unlink(missing_ok=True)
+
     def recent(self, limit: int = 20) -> list[Task]:
+        self.purge_old()
         return sorted(self._tasks.values(), key=lambda x: x.started, reverse=True)[:limit]
