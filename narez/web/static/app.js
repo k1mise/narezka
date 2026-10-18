@@ -207,14 +207,14 @@ async function onTaskDone(t) {
 function startTracking(task) { S.tracked.add(task.id); S.trackId = task.id; S.tasks = [task, ...S.tasks.filter(t => t.id !== task.id)]; renderPill(); }
 
 /* ---------- режим нарезки ---------- */
-const cutDefaults = {mode: "moments", length: 45, overlap: 2.5, audio: "ru", adSb: null, adText: null};
+const cutDefaults = {mode: "moments", length: 45, overlap: 2.5, audio: "ru", adSb: null, adText: null, subs: "youtube"};
 function cutState() {
   if (!S.cut) { try { S.cut = {...cutDefaults, ...JSON.parse(localStorage.getItem("cut") || "{}")}; } catch (e) { S.cut = {...cutDefaults}; } }
   return S.cut;
 }
 const cutSave = () => { try { localStorage.setItem("cut", JSON.stringify(S.cut)); } catch (e) {} };
 const cutPayload = () => { const c = cutState(); return {mode: c.mode, length: +c.length || 45, overlap: c.overlap === "" ? 2.5 : +c.overlap, audio: c.audio === "original" ? "original" : "ru",
-  adcut_sb: c.adSb == null ? !!(S.cfg && S.cfg.adcut_sb) : !!c.adSb, adcut_text: c.adText == null ? !!(S.cfg && S.cfg.adcut_text) : !!c.adText}; };
+  subs_fallback: c.subs === "whisper" ? "whisper" : "youtube", adcut_sb: c.adSb == null ? !!(S.cfg && S.cfg.adcut_sb) : !!c.adSb, adcut_text: c.adText == null ? !!(S.cfg && S.cfg.adcut_text) : !!c.adText}; };
 function cutBox() {
   const c = cutState();
   const num = (key, step, min, max) => { const i = h("input", {type: "number", step: String(step), min: String(min), max: String(max), value: String(c[key]), style: {width: "90px"}});
@@ -229,13 +229,16 @@ function cutBox() {
   draw();
   const aud = h("select", {style: {width: "auto"}}, [["ru", "Звук: русский (если есть дубляж)"], ["original", "Звук: оригинал"]].map(([k, t]) => h("option", {value: k}, t)));
   aud.value = c.audio === "original" ? "original" : "ru"; aud.onchange = () => { c.audio = aud.value; cutSave(); };
+  const subsSel = h("select", {style: {width: "auto"}, title: "Ручные субтитры YouTube (если есть) берутся всегда. Здесь — что делать, если их нет."},
+    [["youtube", "Нет ручных субтитров → автоматические YouTube (быстро)"], ["whisper", "Нет ручных субтитров → распознать речь Whisper (точнее, дольше)"]].map(([k, t]) => h("option", {value: k}, t)));
+  subsSel.value = c.subs === "whisper" ? "whisper" : "youtube"; subsSel.onchange = () => { c.subs = subsSel.value; cutSave(); };
   const pay = cutPayload();
   const chk = (key, label, hint, val) => { const i = h("input", {type: "checkbox"}); i.checked = val; i.onchange = () => { c[key] = i.checked; cutSave(); };
     return h("label", {class: "check", title: hint}, i, h("span", {}, label)); };
   const ads = h("div", {class: "row", style: {gap: "18px", marginTop: "10px"}},
     chk("adText", "Вырезать рекламу по тексту (локальная модель)", "Ищет в речи «промокод», «ссылка в описании», «скидка» и т. п., модель проверяет границы вставки, вырезается до нарезки", pay.adcut_text),
     chk("adSb", "Вырезать рекламу по SponsorBlock (только YouTube)", "Готовая разметка спонсорских вставок от зрителей; для свежих и русскоязычных видео разметки может не быть", pay.adcut_sb));
-  return h("div", {style: {marginTop: "12px"}}, h("div", {class: "row", style: {gap: "12px"}}, seg, aud), params, ads);
+  return h("div", {style: {marginTop: "12px"}}, h("div", {class: "row", style: {gap: "12px", flexWrap: "wrap"}}, seg, aud), h("div", {class: "row", style: {marginTop: "10px"}}, subsSel), params, ads);
 }
 
 /* ---------- панель ---------- */

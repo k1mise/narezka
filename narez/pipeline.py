@@ -12,6 +12,7 @@ from .banner import config_spec, probe
 from .editor import find_cut, make_thumb, render_clip
 from .meta import split_hashtags
 from .models import Moment
+from . import captions
 from . import filler as filler_mod
 from .moments import find_moments, make_metadata, scrub
 from .subtitles import make_ass
@@ -84,9 +85,23 @@ class _Timer:
         self.log(f"  Всего: {total:.0f} с")
 
 
+def speech(video: Path, title: str, cfg: dict, log=print, subs_fallback: str = "youtube") -> list:
+    """Предложения с таймкодами слов: из субтитров YouTube (ручные всегда; автоматические — если выбрано), иначе Whisper."""
+    try:
+        dur = probe(video)["duration"]
+    except Exception:  # noqa: BLE001
+        dur = None
+    got = captions.load(video, subs_fallback == "youtube", dur)
+    if got:
+        segs, kind, lang = got
+        log(f"Беру {'ручные' if kind == 'manual' else 'автоматические'} субтитры YouTube ({lang}) вместо распознавания Whisper.")
+        return to_sentences(segs, gap=0.8 if kind == "manual" else 0.5)   # без пунктуации (автосубтитры) предложения режем по паузам
+    return to_sentences(transcribe(video, cfg, log, hint=title))
+
+
 def run(url: str, cfg: dict, db: dbm.DB, group_id: int | None = None, log=print, test: bool = False,
         mode: str = "moments", length: float = 45.0, overlap: float = 2.5, audio: str = "ru",
-        adcut_sb: bool | None = None, adcut_text: bool | None = None):
+        adcut_sb: bool | None = None, adcut_text: bool | None = None, subs_fallback: str = "youtube"):
     """Ссылка -> скачивание -> транскрипт -> моменты -> готовые вертикальные клипы. Возвращает (job_id, [clips]).
     mode="full": без выбора моментов — всё видео режется подряд на части длиной length с нахлёстом overlap."""
     if mode == "full":
@@ -94,7 +109,7 @@ def run(url: str, cfg: dict, db: dbm.DB, group_id: int | None = None, log=print,
     workdir: Path = cfg["paths"]["workdir"]
     tm = _Timer(log)
     log("Скачиваю видео...")
-    video, title = download(url, workdir, log, cfg, audio=audio)
+    video, title = download(url, workdir, log, cfg, audio=audio, subs=subs_fallback)
     log(f"Скачано: {title}")
     tm.lap("скачивание")
 
@@ -102,9 +117,9 @@ def run(url: str, cfg: dict, db: dbm.DB, group_id: int | None = None, log=print,
     sb, tx = adcut.flags(cfg, adcut_sb, adcut_text)
     if full:
         # речь нужна для субтитров и для поиска рекламы; без них распознавание пропускаем (это самый долгий этап)
-        segments = to_sentences(transcribe(video, cfg, log, hint=title)) if (cfg["subtitles"]["enabled"] or tx) else []
+        segments = speech(video, title, cfg, log, subs_fallback) if (cfg["subtitles"]["enabled"] or tx) else []
     else:
-        segments = to_sentences(transcribe(video, cfg, log, hint=title))
+        segments = speech(video, title, cfg, log, subs_fallback)
         if not segments:
             raise RuntimeError("В видео не найдено речи — нечего нарезать.")
     tm.lap("распознавание речи")

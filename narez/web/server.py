@@ -67,11 +67,14 @@ class CutIn(BaseModel):
     audio: str = "ru"            # ru = русская дорожка, если у видео есть дубляж; original = оригинал
     adcut_sb: Optional[bool] = None    # вырезать рекламу по SponsorBlock (None = как в config.toml)
     adcut_text: Optional[bool] = None  # искать рекламу в тексте (None = как в config.toml)
+    subs_fallback: str = "youtube"     # если ручных субтитров YouTube нет: youtube = взять автоматические, whisper = распознать речь
 
 
 def cut_args(b: CutIn) -> dict:
     if b.audio not in ("ru", "original"):
         raise HTTPException(400, "Звук: ru или original")
+    if b.subs_fallback not in ("youtube", "whisper"):
+        raise HTTPException(400, "Субтитры: youtube или whisper")
     if b.mode not in ("moments", "full"):
         raise HTTPException(400, "Режим нарезки: moments или full")
     if b.mode == "full":
@@ -80,7 +83,7 @@ def cut_args(b: CutIn) -> dict:
         if not 0 <= b.overlap <= min(30, b.length - 5):
             raise HTTPException(400, "Нахлёст — от 0 секунд и не больше длины клипа минус 5 секунд")
     return {"mode": b.mode, "length": b.length, "overlap": b.overlap, "audio": b.audio,
-            "adcut_sb": b.adcut_sb, "adcut_text": b.adcut_text}
+            "adcut_sb": b.adcut_sb, "adcut_text": b.adcut_text, "subs_fallback": b.subs_fallback}
 
 
 class ProcessIn(CutIn):

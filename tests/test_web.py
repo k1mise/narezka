@@ -506,8 +506,11 @@ def test_cut_params_validation(env, monkeypatch):
     r = c.post("/api/process", json={**base, "mode": "full", "length": 30, "overlap": 4})
     assert r.status_code == 200
     wait_task(c, r.json())
-    assert got == [{"mode": "full", "length": 30.0, "overlap": 4.0, "audio": "ru", "adcut_sb": None, "adcut_text": None}]
+    assert got == [{"mode": "full", "length": 30.0, "overlap": 4.0, "audio": "ru", "adcut_sb": None, "adcut_text": None, "subs_fallback": "youtube"}]
     assert c.post("/api/process", json={**base, "audio": "de"}).status_code == 400
+    assert c.post("/api/process", json={**base, "subs_fallback": "x"}).status_code == 400
+    wait_task(c, c.post("/api/process", json={**base, "subs_fallback": "whisper"}).json())
+    assert got[-1]["subs_fallback"] == "whisper"
     wait_task(c, c.post("/api/process", json={**base, "audio": "original"}).json())
     assert got[-1]["audio"] == "original"
 

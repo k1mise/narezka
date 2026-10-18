@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from . import captions
 import re
 from pathlib import Path
 
@@ -123,10 +124,11 @@ def format_for(audio: str, height: int, has_ru: bool) -> str:
     return base
 
 
-def download(url: str, workdir: Path, log=print, cfg: dict | None = None, audio: str = "ru") -> tuple[Path, str]:
+def download(url: str, workdir: Path, log=print, cfg: dict | None = None, audio: str = "ru", subs: str = "youtube") -> tuple[Path, str]:
     """Возвращает (путь к видео, название). Источник: ссылка (yt-dlp: YouTube и ~1000 сайтов, прямые ссылки на файлы,
     страницы с видеоплеером) или путь к локальному видеофайлу (скачивание пропускается).
-    Файл называется по названию видео («Как дрессировать щенка.mp4»)."""
+    Файл называется по названию видео («Как дрессировать щенка.mp4»). Рядом сохраняются субтитры YouTube (см. captions.py):
+    ручные — всегда, автоматические — если subs="youtube"."""
     src = normalize_source(url)
     if is_local(src):
         p = Path(src)
@@ -193,6 +195,13 @@ def download(url: str, workdir: Path, log=print, cfg: dict | None = None, audio:
                 if not path.exists() and path.with_suffix(".mp4").exists():
                     path = path.with_suffix(".mp4")
             (out_dir / f"{base}.src").write_text(str(info.get("id") or ""), encoding="utf-8")
+            try:
+                kind = captions.fetch(ydl, info, path, captions.wanted_lang(info, ru and audio == "ru", cfg), subs == "youtube", log)
+                if kind:
+                    log("Нашёл ручные субтитры YouTube — речь распознавать не нужно." if kind == "manual"
+                        else "Нашёл автоматические субтитры YouTube — Whisper не понадобится." if subs == "youtube" else "")
+            except Exception as e:  # noqa: BLE001 — субтитры необязательны
+                log(f"Субтитры YouTube пропущены: {str(e)[:100]}")
             return path, info.get("title") or path.stem
 
     try:
