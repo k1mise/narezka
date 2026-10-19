@@ -14,7 +14,7 @@ from .meta import split_hashtags
 from .models import Moment
 from . import captions
 from . import filler as filler_mod
-from .moments import find_moments, make_metadata, scrub
+from .moments import drop_noise, find_moments, find_reddit, make_metadata, scrub
 from .subtitles import make_ass
 from .transcriber import to_sentences, transcribe
 
@@ -95,13 +95,14 @@ def speech(video: Path, title: str, cfg: dict, log=print, subs_fallback: str = "
     if got:
         segs, kind, lang = got
         log(f"Беру {'ручные' if kind == 'manual' else 'автоматические'} субтитры YouTube ({lang}) вместо распознавания Whisper.")
-        return to_sentences(segs, gap=0.8 if kind == "manual" else 0.5)   # без пунктуации (автосубтитры) предложения режем по паузам
-    return to_sentences(transcribe(video, cfg, log, hint=title))
+        return drop_noise(to_sentences(segs, gap=0.8 if kind == "manual" else 0.5))   # без пунктуации (автосубтитры) предложения режем по паузам
+    return drop_noise(to_sentences(transcribe(video, cfg, log, hint=title)))      # фразы-пометки («[Музыка]», ♪) клипом не бывают
 
 
 def run(url: str, cfg: dict, db: dbm.DB, group_id: int | None = None, log=print, test: bool = False,
         mode: str = "moments", length: float = 45.0, overlap: float = 2.5, audio: str = "ru",
-        adcut_sb: bool | None = None, adcut_text: bool | None = None, subs_fallback: str = "youtube", tiktok: bool = False):
+        adcut_sb: bool | None = None, adcut_text: bool | None = None, subs_fallback: str = "youtube", tiktok: bool = False,
+        reddit: bool = False, trim_end: float = 15.0):
     """Ссылка -> скачивание -> транскрипт -> моменты -> готовые вертикальные клипы. Возвращает (job_id, [clips]).
     mode="full": без выбора моментов — всё видео режется подряд на части длиной length с нахлёстом overlap."""
     if mode == "full":
@@ -131,8 +132,23 @@ def run(url: str, cfg: dict, db: dbm.DB, group_id: int | None = None, log=print,
         if not full and not segments:
             raise RuntimeError("После вырезания рекламы в видео не осталось речи — нечего нарезать.")
 
+    limit = None       # конец исходника отрезается (титры, музыка, прощание): всё после limit в клипы не попадает
+    if trim_end and trim_end > 0:
+        try:
+            dur = probe(video)["duration"]
+        except Exception:  # noqa: BLE001
+            dur = 0
+        if dur - trim_end >= 10:
+            limit = dur - trim_end
+            segments = [x for x in segments if x.end <= limit + 0.01]
+            log(f"Отрезаю последние {trim_end:g} с исходника (клипы берутся из первых {limit:.0f} с).")
+            if not full and not segments:
+                raise RuntimeError("После отрезания конца в видео не осталось речи — нечего нарезать.")
+        else:
+            log("Видео слишком короткое, чтобы отрезать от него конец — беру целиком.")
+
     if full:
-        total = probe(video)["duration"]
+        total = limit if limit else probe(video)["duration"]
         parts = plan_parts(total, length, overlap)
         moments = []
         for i, (a, b) in enumerate(parts, 1):
@@ -140,7 +156,11 @@ def run(url: str, cfg: dict, db: dbm.DB, group_id: int | None = None, log=print,
             moments.append(Moment(a, b, title[:90 - len(suffix)].rstrip() + suffix, "", 0.0))
         log(f"Режу видео целиком: {len(moments)} частей по {length:g} с, нахлёст {overlap:g} с.")
     else:
-        moments = find_moments(segments, cfg, log)
+        if reddit:
+            log("Режим «Реддит»: ищу истории и собираю клипы по 2–3 истории с комментариями.")
+            moments = find_reddit(segments, cfg, log)
+        else:
+            moments = find_moments(segments, cfg, log)
         if not moments:
             raise RuntimeError("Модель не нашла подходящих моментов. Попробуй модель побольше или другое видео.")
         log(f"Выбрано моментов: {len(moments)}")
@@ -166,6 +186,8 @@ def run(url: str, cfg: dict, db: dbm.DB, group_id: int | None = None, log=print,
         # режем по реальным паузам в звуке; субтитры считаем от тех же границ
         # (в режиме «целиком» границы строго по сетке — иначе нахлёст между частями поплывёт)
         rs, re_ = (m.start, m.end) if full else cut_bounds(video, m, segments, cfg)
+        if limit:
+            re_ = min(re_, limit)
         tm.lap("поиск точек реза")
         ass = make_ass(segments, rs, re_, sub_cfg, log, topic=title) if cfg["subtitles"]["enabled"] else None
         tm.lap("субтитры (LLM)")

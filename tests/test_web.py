@@ -506,7 +506,7 @@ def test_cut_params_validation(env, monkeypatch):
     r = c.post("/api/process", json={**base, "mode": "full", "length": 30, "overlap": 4})
     assert r.status_code == 200
     wait_task(c, r.json())
-    assert got == [{"mode": "full", "length": 30.0, "overlap": 4.0, "audio": "ru", "adcut_sb": None, "adcut_text": None, "subs_fallback": "youtube"}]
+    assert got == [{"mode": "full", "length": 30.0, "overlap": 4.0, "audio": "ru", "adcut_sb": None, "adcut_text": None, "subs_fallback": "youtube", "reddit": False, "trim_end": 15.0}]
     assert c.post("/api/process", json={**base, "audio": "de"}).status_code == 400
     assert c.post("/api/process", json={**base, "subs_fallback": "x"}).status_code == 400
     wait_task(c, c.post("/api/process", json={**base, "subs_fallback": "whisper"}).json())
@@ -1139,7 +1139,7 @@ def test_tiktok_accounts_and_one_time_helper_login(env):
     assert c.get("/api/tiktok/pending", headers={"X-Narez-Helper": "1"}).status_code == 404
     assert c.post(f"/api/tiktok/accounts/{a['id']}/arm").status_code == 200
     r = c.get("/api/tiktok/pending", headers={"X-Narez-Helper": "1"}).json()
-    assert r == {"label": "Мемы", "login": "a@b.c", "password": "секрет"}
+    assert r == {"id": a["id"], "label": "Мемы", "login": "a@b.c", "password": "секрет"}
     assert c.get("/api/tiktok/pending", headers={"X-Narez-Helper": "1"}).status_code == 404     # одноразово
     # чужой Host по-прежнему блокируется
     c.post(f"/api/tiktok/accounts/{a['id']}/arm")
@@ -1148,3 +1148,35 @@ def test_tiktok_accounts_and_one_time_helper_login(env):
     c.put(f"/api/tiktok/accounts/{a['id']}", json={"label": "Мемы 2", "login": "x@y.z"})
     assert db.tiktok_account(a["id"])["password"] == "секрет" and db.tiktok_account(a["id"])["label"] == "Мемы 2"
     assert c.delete(f"/api/tiktok/accounts/{a['id']}").status_code == 200 and c.get("/api/tiktok/accounts").json() == []
+
+
+@pytest.mark.skipif(not shutil.which("ffmpeg"), reason="нужен ffmpeg")
+def test_trim_end_cuts_tail_of_source(env, tmp_path):
+    c, cfg, db, app = env
+    from narez import pipeline
+    src = tmp_path / "long.mp4"
+    subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", "testsrc=size=320x180:rate=15:duration=20",
+                    "-f", "lavfi", "-i", "sine=frequency=300:duration=20", "-shortest", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                    "-c:a", "aac", str(src)], check=True)
+    cfg["subtitles"]["enabled"] = False
+    cfg["adcut"] = {"sponsorblock": False, "text": False}
+    cfg["clips"].update(width=270, height=480, preset="ultrafast")
+    g = db.add_group("g")
+    logs = []
+    job, clips = pipeline.run(str(src), cfg, db, g, logs.append, mode="full", length=8, overlap=2.5, trim_end=5)
+    assert max(c_["end"] for c_ in clips) <= 15.01 and len(clips) == 2
+    assert any("Отрезаю последние 5 с" in m for m in logs)
+
+
+def test_cut_params_reddit_and_trim(env, monkeypatch):
+    c, cfg, db, _ = env
+    g = db.add_group("g")
+    got = []
+    monkeypatch.setattr("narez.web.server.run_pipeline", lambda src, cfg_, db_, gid, log, test=False, **kw: got.append(kw) or (1, []))
+    base = {"url": "https://a.b/c.mp4", "group_id": g}
+    assert c.post("/api/process", json={**base, "trim_end": -1}).status_code == 400
+    assert c.post("/api/process", json={**base, "trim_end": 500}).status_code == 400
+    wait_task(c, c.post("/api/process", json={**base, "reddit": True, "trim_end": 0}).json())
+    assert got[-1]["reddit"] is True and got[-1]["trim_end"] == 0
+    wait_task(c, c.post("/api/process", json={**base, "reddit": True, "mode": "full"}).json())
+    assert got[-1]["reddit"] is False        # «Реддит» только для режима «интересные моменты»

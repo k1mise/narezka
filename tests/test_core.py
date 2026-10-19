@@ -651,3 +651,45 @@ def test_metadata_scrubs_author_mentions(monkeypatch):
     assert "@" not in t and "MrBeast" not in t
     assert "Источник" not in d and "Автор" not in d and "http" not in d and "#тема" in d
     assert moments.scrub("Текст\nSource: x\nhttps://youtube.com/watch?v=1") == "Текст"
+
+
+# ---------- музыка в начале, «Реддит», отрезание конца ----------
+def _seg(t0, t1, text):
+    return Segment(t0, t1, text, [Word(t0, t1, text)])
+
+
+def test_noise_phrases_are_dropped_and_never_start_a_clip():
+    from narez.moments import drop_noise, is_noise
+    assert all(is_noise(x) for x in ["[Музыка]", "♪", "(музыка)", "[Аплодисменты]", "♪♪ ♪", "[Music]", "..."])
+    assert not is_noise("Музыка Баха спасла мне жизнь")
+    segs = [_seg(0, 5, "[Музыка]"), _seg(5, 9, "Ну."), _seg(9, 20, "Он забрал у меня всё, и вот что я сделал."), _seg(20, 45, "Дальше было ещё хуже, потому что она пришла.")]
+    assert [s.text for s in drop_noise(segs)][0] == "Ну."
+    m = snap(Moment(0, 40, "t", "r", 5), segs, 20, 60)        # старт на музыке/обрывке сдвигается на настоящую фразу
+    assert m.start == 9
+
+
+def test_group_stories_two_to_three_per_clip():
+    from narez.moments import group_stories
+    def st(a, b): return Moment(a, b, f"s{a}", "", 7)
+    # истории по ~50 с: три в клип (150 с)
+    clips = group_stories([st(i * 50, (i + 1) * 50) for i in range(6)], 60, 180)
+    assert [(c.start, c.end) for c in clips] == [(0, 150), (150, 300)]
+    # истории по ~100 с: три не влезают в 180 — по две... точнее одна-две в пределах 180
+    clips = group_stories([st(i * 100, (i + 1) * 100) for i in range(4)], 60, 180)
+    assert all(c.end - c.start <= 180 for c in clips) and clips[0].start == 0
+    # короткий хвост присоединяется к предыдущему клипу
+    clips = group_stories([st(0, 60), st(60, 120), st(120, 180), st(180, 200)], 60, 220)
+    assert len(clips) == 1 and clips[0].end == 200
+    # одна огромная история режется по максимуму
+    assert group_stories([st(0, 500)], 60, 180)[0].end == 180
+
+
+def test_reddit_stories_uses_llm_boundaries(monkeypatch):
+    from narez import moments
+    segs = [_seg(i * 10, i * 10 + 9, f"фраза {i}.") for i in range(30)]       # 0..300 с
+    monkeypatch.setattr(moments, "chat_json", lambda cfg, system, text: {"stories": [{"start": 20, "title": "А"}, {"start": 120, "title": "Б"}, {"start": 220, "title": "В"}]})
+    cfg = {"llm": {}, "reddit": {"min_seconds": 60, "max_seconds": 180}}
+    st = moments.reddit_stories(segs, cfg, lambda *_: None)
+    assert [(s.start, s.end, s.title) for s in st] == [(20, 120, "А"), (120, 220, "Б"), (220, 299, "В")]
+    clips = moments.find_reddit(segs, cfg, lambda *_: None)
+    assert clips and all(60 * 0.7 <= c.end - c.start <= 180 for c in clips) and clips[0].start == 20

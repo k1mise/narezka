@@ -230,11 +230,11 @@ def test_pipeline_uses_ad_free_video(tmp_path, monkeypatch):
     monkeypatch.setattr(pipeline, "render_clip", fake_render)
     monkeypatch.setattr(pipeline, "make_metadata", lambda m, *a, **k: (m.title, m.reason))
     db = DB(cfg["paths"]["db"]); g = db.add_group("g")
-    job_id, clips = pipeline.run("https://x.y/v", cfg, db, g, lambda *_: None, adcut_sb=False, adcut_text=True)
+    job_id, clips = pipeline.run("https://x.y/v", cfg, db, g, lambda *_: None, adcut_sb=False, adcut_text=True, trim_end=0)
     assert got["video"].name == "Видео.noads.mp4"
     assert all("промокод" not in s.text.lower() for s in got["segments"]) and len(got["segments"]) == 24
     assert db.job(job_id)["source_path"] == str(v)                       # исходником остаётся скачанный файл
     # без галочек — исходное видео и исходный транскрипт
     got.clear()
-    pipeline.run("https://x.y/v", cfg, db, g, lambda *_: None, adcut_sb=False, adcut_text=False)
+    pipeline.run("https://x.y/v", cfg, db, g, lambda *_: None, adcut_sb=False, adcut_text=False, trim_end=0)
     assert got["video"] == v and len(got["segments"]) == 30

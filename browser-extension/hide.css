@@ -1,0 +1,2 @@
+/* баннер про куки на tiktok.com скрываем целиком (элемент и его shadow-содержимое) */
+tiktok-cookie-banner, [class*="cookie-banner" i], [class*="CookieBanner"], [id*="cookie-banner" i], [data-e2e*="cookie" i] { display: none !important; visibility: hidden !important; }

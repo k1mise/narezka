@@ -3,10 +3,41 @@
   "name": "narez — вход в TikTok",
   "version": "1.0.0",
   "description": "По кнопке «Войти» в программе narez выходит из TikTok в этом браузере и входит в выбранный аккаунт.",
-  "permissions": ["cookies", "browsingData", "scripting", "tabs"],
-  "host_permissions": ["https://*.tiktok.com/*", "http://127.0.0.1/*", "http://localhost/*"],
-  "background": { "service_worker": "background.js" },
+  "permissions": [
+    "cookies",
+    "browsingData",
+    "scripting",
+    "tabs",
+    "storage"
+  ],
+  "host_permissions": [
+    "https://*.tiktok.com/*",
+    "http://127.0.0.1/*",
+    "http://localhost/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
   "content_scripts": [
-    { "matches": ["http://127.0.0.1/*", "http://localhost/*"], "js": ["content.js"], "run_at": "document_start" }
+    {
+      "matches": [
+        "http://127.0.0.1/*",
+        "http://localhost/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_start"
+    },
+    {
+      "matches": [
+        "https://*.tiktok.com/*"
+      ],
+      "css": [
+        "hide.css"
+      ],
+      "run_at": "document_start",
+      "all_frames": true
+    }
   ]
 }

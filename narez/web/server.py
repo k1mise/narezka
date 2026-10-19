@@ -67,6 +67,8 @@ class CutIn(BaseModel):
     audio: str = "ru"            # ru = русская дорожка, если у видео есть дубляж; original = оригинал
     adcut_sb: Optional[bool] = None    # вырезать рекламу по SponsorBlock (None = как в config.toml)
     adcut_text: Optional[bool] = None  # искать рекламу в тексте (None = как в config.toml)
+    reddit: bool = False               # режим «Реддит» (только moments): клипы из 2–3 историй с комментариями, 60–180 с
+    trim_end: float = 15.0             # сколько секунд отрезать от конца исходника перед нарезкой (0 = не отрезать)
     subs_fallback: str = "youtube"     # если ручных субтитров YouTube нет: youtube = взять автоматические, whisper = распознать речь
 
 
@@ -75,6 +77,8 @@ def cut_args(b: CutIn) -> dict:
         raise HTTPException(400, "Звук: ru или original")
     if b.subs_fallback not in ("youtube", "whisper"):
         raise HTTPException(400, "Субтитры: youtube или whisper")
+    if not 0 <= b.trim_end <= 120:
+        raise HTTPException(400, "Сколько отрезать от конца исходника — от 0 до 120 секунд")
     if b.mode not in ("moments", "full"):
         raise HTTPException(400, "Режим нарезки: moments или full")
     if b.mode == "full":
@@ -83,7 +87,8 @@ def cut_args(b: CutIn) -> dict:
         if not 0 <= b.overlap <= min(30, b.length - 5):
             raise HTTPException(400, "Нахлёст — от 0 секунд и не больше длины клипа минус 5 секунд")
     return {"mode": b.mode, "length": b.length, "overlap": b.overlap, "audio": b.audio,
-            "adcut_sb": b.adcut_sb, "adcut_text": b.adcut_text, "subs_fallback": b.subs_fallback}
+            "adcut_sb": b.adcut_sb, "adcut_text": b.adcut_text, "subs_fallback": b.subs_fallback,
+            "reddit": bool(b.reddit and b.mode == "moments"), "trim_end": b.trim_end}
 
 
 class ProcessIn(CutIn):
@@ -995,7 +1000,7 @@ def create_app(cfg: dict | None = None) -> FastAPI:
             tt_armed.pop(acc_id, None)
             r = d.tiktok_account(acc_id)
             if r and until >= now:
-                return {"label": r["label"], "login": r["login"], "password": r["password"]}
+                return {"id": r["id"], "label": r["label"], "login": r["login"], "password": r["password"]}
         raise HTTPException(404, "Нет ожидающего входа")
 
     # ---------- папки и файлы ----------

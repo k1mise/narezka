@@ -214,14 +214,14 @@ async function onTaskDone(t) {
 function startTracking(task) { S.tracked.add(task.id); S.trackId = task.id; S.tasks = [task, ...S.tasks.filter(t => t.id !== task.id)]; renderPill(); }
 
 /* ---------- режим нарезки ---------- */
-const cutDefaults = {mode: "moments", length: 45, overlap: 2.5, audio: "ru", adSb: null, adText: null, subs: "youtube"};
+const cutDefaults = {mode: "moments", length: 45, overlap: 2.5, audio: "ru", adSb: null, adText: null, subs: "youtube", reddit: false, trim: 15};
 function cutState() {
   if (!S.cut) { try { S.cut = {...cutDefaults, ...JSON.parse(localStorage.getItem("cut") || "{}")}; } catch (e) { S.cut = {...cutDefaults}; } }
   return S.cut;
 }
 const cutSave = () => { try { localStorage.setItem("cut", JSON.stringify(S.cut)); } catch (e) {} };
 const cutPayload = () => { const c = cutState(); return {mode: c.mode, length: +c.length || 45, overlap: c.overlap === "" ? 2.5 : +c.overlap, audio: c.audio === "original" ? "original" : "ru",
-  subs_fallback: c.subs === "whisper" ? "whisper" : "youtube", adcut_sb: c.adSb == null ? !!(S.cfg && S.cfg.adcut_sb) : !!c.adSb, adcut_text: c.adText == null ? !!(S.cfg && S.cfg.adcut_text) : !!c.adText}; };
+  subs_fallback: c.subs === "whisper" ? "whisper" : "youtube", reddit: c.mode === "moments" && !!c.reddit, trim_end: c.trim === "" || c.trim == null ? 15 : Math.max(0, +c.trim || 0), adcut_sb: c.adSb == null ? !!(S.cfg && S.cfg.adcut_sb) : !!c.adSb, adcut_text: c.adText == null ? !!(S.cfg && S.cfg.adcut_text) : !!c.adText}; };
 function cutBox() {
   const c = cutState();
   const num = (key, step, min, max) => { const i = h("input", {type: "number", step: String(step), min: String(min), max: String(max), value: String(c[key]), style: {width: "90px"}});
@@ -230,7 +230,10 @@ function cutBox() {
     h("label", {class: "muted small"}, "Длина клипа, с", h("div", {}, num("length", 1, 5, 180))),
     h("label", {class: "muted small"}, "Нахлёст, с", h("div", {}, num("overlap", 0.5, 0, 30))),
     h("div", {class: "grow muted small"}, "Каждый следующий клип начинается с последних секунд предыдущего. Видео режется подряд, целиком, без выбора моментов — заголовки «Часть N/M» можно поменять в редакторе."));
-  const draw = () => { params.style.display = c.mode === "full" ? "" : "none"; seg.querySelectorAll("button").forEach(b => b.classList.toggle("on", b.dataset.k === c.mode)); };
+  const redditBox = h("label", {class: "check", title: "Для видео, где диктор читает истории с Reddit (и иногда комментарии к ним). Клип собирается из 2–3 историй вместе с комментариями, длиной 60–180 секунд."},
+    h("input", {type: "checkbox", onchange: e => { c.reddit = e.target.checked; cutSave(); }}), h("span", {}, "Реддит: в клипе 2–3 истории с комментариями (60–180 с)"));
+  redditBox.querySelector("input").checked = !!c.reddit;
+  const draw = () => { params.style.display = c.mode === "full" ? "" : "none"; redditBox.style.display = c.mode === "full" ? "none" : ""; seg.querySelectorAll("button").forEach(b => b.classList.toggle("on", b.dataset.k === c.mode)); };
   const seg = h("div", {class: "seg"}, [["moments", "Интересные моменты"], ["full", "Нарезать целиком"]].map(([k, t]) =>
     h("button", {class: "", "data-k": k, onclick: () => { c.mode = k; cutSave(); draw(); }}, t)));
   draw();
@@ -245,7 +248,10 @@ function cutBox() {
   const ads = h("div", {class: "row", style: {gap: "18px", marginTop: "10px"}},
     chk("adText", "Вырезать рекламу по тексту (локальная модель)", "Ищет в речи «промокод», «ссылка в описании», «скидка» и т. п., модель проверяет границы вставки, вырезается до нарезки", pay.adcut_text),
     chk("adSb", "Вырезать рекламу по SponsorBlock (только YouTube)", "Готовая разметка спонсорских вставок от зрителей; для свежих и русскоязычных видео разметки может не быть", pay.adcut_sb));
-  return h("div", {style: {marginTop: "12px"}}, h("div", {class: "row", style: {gap: "12px", flexWrap: "wrap"}}, seg, aud), h("div", {class: "row", style: {marginTop: "10px"}}, subsSel), params, ads);
+  const trim = h("input", {type: "number", step: "1", min: "0", max: "120", value: String(c.trim ?? 15), style: {width: "80px"}});
+  trim.oninput = () => { c.trim = trim.value; cutSave(); };
+  const trimRow = h("label", {class: "muted small", title: "Конец исходника часто занимают титры, музыка и прощание. 0 — ничего не отрезать."}, "Отрезать конец исходника, с ", trim);
+  return h("div", {style: {marginTop: "12px"}}, h("div", {class: "row", style: {gap: "12px", flexWrap: "wrap"}}, seg, aud), h("div", {class: "row", style: {marginTop: "10px", gap: "16px", flexWrap: "wrap"}}, subsSel, trimRow), params, h("div", {style: {marginTop: "10px"}}, redditBox), ads);
 }
 
 /* ---------- панель ---------- */
@@ -1302,22 +1308,22 @@ function helperPing(timeout = 700) {
     window.postMessage({narez: "tiktok", op: "ping"}, "*");
   });
 }
-function helperLogin(timeout = 70000) {
+function helperLogin(force, timeout = 70000) {
   return new Promise(res => {
     const on = ev => { if (ev.source === window && ev.data && ev.data.narez === "tiktok-reply" && ev.data.op === "login") { removeEventListener("message", on); clearTimeout(tm); res(ev.data); } };
     const tm = setTimeout(() => { removeEventListener("message", on); res({ok: false, error: "Расширение не ответило"}); }, timeout);
     addEventListener("message", on);
-    window.postMessage({narez: "tiktok", op: "login"}, "*");
+    window.postMessage({narez: "tiktok", op: "login", force: !!force}, "*");
   });
 }
-async function ttLogin(a) {
+async function ttLogin(a, force) {
   if (!(await helperPing())) return dialog(h("div", {}, h("h3", {}, "Нужно расширение браузера"), h("div", {class: "muted"}, TT_EXT_HINT)), [{text: "Понятно", cls: "primary"}]);
   try {
     await api("POST", `/api/tiktok/accounts/${a.id}/arm`);
     toast(`Вхожу в «${a.label}»: сброшу вход TikTok в этом браузере и открою страницу входа…`);
-    const r = await helperLogin();
+    const r = await helperLogin(force);
     if (!r.ok) return toast(r.error || "Не удалось войти", "err");
-    toast(r.clicked === false ? "Логин и пароль вписаны — нажми «Log in» сам" : "Данные введены. Если TikTok просит капчу или код — подтверди его сам");
+    toast(r.restored ? "Сессия аккаунта восстановлена — код с почты не нужен. Если TikTok всё же просит войти, нажми «С паролем»" : r.clicked === false ? "Логин и пароль вписаны — нажми «Log in» сам" : "Данные введены. Если TikTok просит капчу или код — подтверди его сам");
   } catch (e) { fail(e); }
 }
 function ttAccountDialog(a) {
@@ -1350,6 +1356,7 @@ function ttAccountsBlock() {
       h("div", {class: "plat tiktok"}, "TT"),
       h("div", {class: "grow"}, h("b", {}, a.label), h("span", {class: "muted small"}, a.login + (a.note ? " · " + a.note : ""))),
       h("button", {class: "btn sm primary", title: "Выйти из TikTok в этом браузере и войти в этот аккаунт", onclick: () => ttLogin(a)}, "Войти"),
+      h("button", {class: "btn sm", title: "Не восстанавливать сохранённую сессию, а войти по логину и паролю (если сессия устарела)", onclick: () => ttLogin(a, true)}, "С паролем"),
       h("button", {class: "btn sm", onclick: () => ttAccountDialog(a)}, "Изменить"),
       h("button", {class: "btn sm danger", onclick: () => confirmBox("Удалить аккаунт?", `«${a.label}» и сохранённые данные входа будут удалены из narez.`, "Удалить", async () => {
         try { await api("DELETE", `/api/tiktok/accounts/${a.id}`); await loadTikTok(); render(); } catch (e) { fail(e); } })}, "Убрать")))

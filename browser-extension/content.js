@@ -4,7 +4,7 @@ window.addEventListener("message", (ev) => {
   if (ev.data.op === "ping") {
     window.postMessage({ narez: "tiktok-reply", op: "pong", version: chrome.runtime.getManifest().version }, "*");
   } else if (ev.data.op === "login") {
-    chrome.runtime.sendMessage({ op: "login", origin: location.origin }, (res) => {
+    chrome.runtime.sendMessage({ op: "login", origin: location.origin, force: !!ev.data.force }, (res) => {
       const err = chrome.runtime.lastError;
       window.postMessage({ narez: "tiktok-reply", op: "login", ok: !err && !!(res && res.ok),
                            error: err ? err.message : (res && res.error) || "" }, "*");
