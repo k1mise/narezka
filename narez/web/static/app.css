@@ -181,3 +181,14 @@ dialog h3{margin:0 0 8px}dialog .acts{display:flex;gap:10px;justify-content:flex
 .hgroup-head .caret{width:14px;color:var(--muted)}
 .hgroup-head .hstat{font-size:13px;color:var(--muted);font-variant-numeric:tabular-nums}
 label.btn.disabled{opacity:.5;pointer-events:none}
+
+/* TikTok */
+.tt-block{border-left:4px solid #25f4ee;box-shadow:inset 4px 0 0 #fe2c55,var(--shadow)}
+.tt-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(520px,1fr));gap:18px}
+.tt-card{display:grid;grid-template-columns:200px 1fr;gap:16px;align-items:start}
+.tt-frame{background:#000;border-radius:12px;overflow:hidden;aspect-ratio:9/16}
+.tt-frame video{width:100%;height:100%;object-fit:contain;display:block}
+.tt-body{display:flex;flex-direction:column;gap:6px;min-width:0}
+.tt-body textarea{resize:vertical}
+.tt-path{word-break:break-all;margin:4px 0}
+@media (max-width:720px){.tt-grid{grid-template-columns:1fr}.tt-card{grid-template-columns:130px 1fr}}

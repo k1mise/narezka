@@ -8,9 +8,10 @@ const ICONS = {
   proxies: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c3 3.2 3 14.8 0 18M12 3c-3 3.2-3 14.8 0 18"/></svg>',
   templates: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="6" rx="1"/><rect x="3" y="13" width="8" height="8" rx="1"/><path d="M15 13h6M15 17h6M15 21h6"/></svg>',
   presets: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 6h10M18 6h2M4 12h4M12 12h8M4 18h12M20 18h0"/><circle cx="16" cy="6" r="2"/><circle cx="10" cy="12" r="2"/><circle cx="18" cy="18" r="2"/></svg>',
+  tiktok: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 3v11.5a3.5 3.5 0 1 1-3.5-3.5"/><path d="M14 3c.4 2.6 2 4.2 5 4.5"/></svg>',
   history: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5M12 7v5l3 2"/></svg>',
 };
-const PAGES = [["panel", "Панель"], ["editor", "Редактор"], ["accounts", "Аккаунты"], ["presets", "Пресеты"], ["templates", "Шаблоны"], ["fillers", "Вставки"], ["history", "История"], ["proxies", "Прокси"]];
+const PAGES = [["panel", "Панель"], ["editor", "Редактор"], ["accounts", "Аккаунты"], ["tiktok", "TikTok"], ["presets", "Пресеты"], ["templates", "Шаблоны"], ["fillers", "Вставки"], ["history", "История"], ["proxies", "Прокси"]];
 const PLAT = {youtube: ["YT", "YouTube Shorts"], tiktok: ["TT", "TikTok"], instagram: ["IG", "Instagram Reels"]};
 
 const S = {
@@ -99,7 +100,8 @@ const clip = () => S.clips.find(c => c.id === S.cid);
 function renderNav() {
   const nav = $("#nav"); nav.replaceChildren();
   for (const [id, name] of PAGES) {
-    const cnt = id === "editor" && S.clips.length ? h("span", {class: "cnt"}, S.clips.length) : null;
+    const n = id === "editor" ? S.clips.length : id === "tiktok" ? (S.tt ? S.tt.clips.length : 0) : 0;
+    const cnt = n ? h("span", {class: "cnt"}, n) : null;
     nav.append(h("button", {class: S.page === id ? "on" : "", onclick: () => go(id)}, h("span", {html: ICONS[id]}), name, cnt));
   }
 }
@@ -114,7 +116,7 @@ function renderHealth() {
 function renderGroupPick() {
   const sel = $("#group"); sel.replaceChildren(...S.groups.map(g => h("option", {value: g.id}, g.name)));
   if (S.gid) sel.value = S.gid;
-  $("#group-pick").hidden = !S.groups.length || ["accounts", "history", "proxies", "editor", "templates", "presets", "fillers"].includes(S.page);
+  $("#group-pick").hidden = !S.groups.length || ["accounts", "history", "proxies", "editor", "templates", "presets", "fillers", "tiktok"].includes(S.page);
 }
 function renderPill() {
   const run = S.tasks.filter(t => t.status === "running");
@@ -136,7 +138,7 @@ function render() {
   // в старый, уже отсоединённый контейнер и не попадают на другую вкладку или в дубль
   const old = $("#page"), page = old.cloneNode(false);
   old.replaceWith(page);
-  ({panel: pagePanel, editor: pageEditor, accounts: pageAccounts, history: pageHistory, proxies: pageProxies, templates: pageTemplates, presets: pagePresets, fillers: pageFillers})[S.page](page);
+  ({panel: pagePanel, editor: pageEditor, accounts: pageAccounts, history: pageHistory, proxies: pageProxies, templates: pageTemplates, presets: pagePresets, fillers: pageFillers, tiktok: pageTikTok})[S.page](page);
 }
 
 /* ---------- данные ---------- */
@@ -149,6 +151,11 @@ async function loadGroups() {
 async function loadClips() {
   S.clips = await api("GET", "/api/clips");   // очередь всех групп: группа клипа выбирается в блоке «Публикация»
   if (!S.clips.some(c => c.id === S.cid)) S.cid = S.clips.length ? S.clips[0].id : null;
+  renderNav();
+}
+async function loadTikTok() {
+  try { S.tt = {clips: await api("GET", "/api/tiktok/clips"), accounts: await api("GET", "/api/tiktok/accounts")}; }
+  catch (e) { S.tt = S.tt || {clips: [], accounts: []}; }
   renderNav();
 }
 async function loadBanners() { S.banners = await api("GET", "/api/banners"); }
@@ -200,7 +207,7 @@ async function onTaskDone(t) {
   else if (t.kind === "stats") toast("Статистика обновлена");
   else if (t.kind === "import") toast(`Добавлено видео: ${t.result.added ?? 0}`);
   else if (t.kind === "proxycheck") toast(`Прокси проверены: рабочих ${t.result.ok ?? 0} из ${t.result.checked ?? 0}`);
-  try { await loadGroups(); await loadClips(); if (t.kind === "stats" || t.kind === "import" || t.kind === "publish") await loadHistory(); } catch (e) {}
+  try { await loadGroups(); await loadClips(); await loadTikTok(); if (t.kind === "stats" || t.kind === "import" || t.kind === "publish") await loadHistory(); } catch (e) {}
   if (t.kind === "preview" && S.page === "editor") S.previewTick = Date.now();
   render();
 }
@@ -260,6 +267,8 @@ function pagePanel(page) {
   const url = h("input", {type: "text", placeholder: "Ссылка на видео (любой сайт), прямая ссылка на файл или путь к файлу", id: "url", autocomplete: "off", spellcheck: "false"});
   const testBox = h("input", {type: "checkbox", id: "testmode"});
   testBox.checked = !!S.testMode; testBox.onchange = () => { S.testMode = testBox.checked; };
+  const ttBox = h("input", {type: "checkbox", id: "ttmode"});
+  ttBox.checked = !!S.ttMode; ttBox.onchange = () => { S.ttMode = ttBox.checked; render(); };
   url.addEventListener("keydown", e => { if (e.key === "Enter") start(); });
   const startBtn = h("button", {class: "btn primary", id: "start", onclick: start}, "Нарезать");
   const tplSel = h("select", {style: {minWidth: "220px"}}, [h("option", {value: ""}, `Без шаблона — только группа «${g.name}»`),
@@ -269,15 +278,16 @@ function pagePanel(page) {
   const tpl = (S.templates || []).find(t => t.id === S.tplId);
   async function start() {
     try {
-      const t = await api("POST", "/api/process", {url: url.value, group_id: S.gid, template_id: S.tplId || undefined, test: testBox.checked, ...cutPayload()});
-      startTracking(t); url.value = ""; toast("Запустил нарезку"); updateRunBox();
+      const t = await api("POST", "/api/process", {url: url.value, group_id: S.gid, template_id: S.tplId || undefined, test: testBox.checked && !ttBox.checked, tiktok: ttBox.checked, ...cutPayload()});
+      startTracking(t); url.value = ""; toast(ttBox.checked ? "Запустил нарезку для TikTok — клипы появятся во вкладке «TikTok»" : "Запустил нарезку"); updateRunBox();
     } catch (e) { fail(e); }
   }
   page.append(h("div", {class: "card"}, h("h2", {}, "Новое видео", h("small", {}, tpl ? `шаблон «${tpl.name}»` : `группа «${g.name}»`)),
     h("div", {class: "hero-input"}, url, startBtn),
-    h("div", {class: "row", style: {margin: "10px 0"}}, h("span", {class: "muted small"}, "Куда:"), tplSel,
+    h("div", {class: "row", style: {margin: "10px 0", opacity: ttBox.checked ? .4 : 1, pointerEvents: ttBox.checked ? "none" : ""}}, h("span", {class: "muted small"}, "Куда:"), tplSel,
       tpl ? h("span", {class: "muted small"}, "клипы появятся в каждой группе шаблона, со своим пресетом баннеров") : null),
     cutBox(),
+    h("label", {class: "check", title: "Клипы без баннера попадут во вкладку «TikTok» для ручной выкладки; группа и шаблон не используются"}, ttBox, h("span", {}, "Для ручной выкладки в TikTok (без баннера, клипы появятся во вкладке «TikTok»)")),
     h("label", {class: "check"}, testBox, h("span", {}, "Тестовый прогон — клипы сохранятся в папку тестов и не будут публиковаться"))));
   page.append(h("div", {id: "runbox"}));
   page.append(filesCard());
@@ -975,6 +985,7 @@ function pageAccounts(page) {
     }
   }
   page.append(h("div", {class: "two"}, left, right));
+  page.append(ttAccountsBlock());
 }
 function keysDialog(a) {
   const id = h("input", {type: "text", placeholder: "123456789-abc….apps.googleusercontent.com", autocomplete: "off", spellcheck: "false"});
@@ -1280,6 +1291,151 @@ function pageProxies(page) {
 function applyTheme(t) {
   if (t) document.documentElement.setAttribute("data-theme", t); else document.documentElement.removeAttribute("data-theme");
 }
+
+/* ---------- TikTok: ручная выкладка ---------- */
+const TT_EXT_HINT = "Расширение не найдено. Установи его один раз: chrome://extensions → «Режим разработчика» → «Загрузить распакованное расширение» → папка browser-extension из проекта. Потом обнови эту страницу (F5).";
+function helperPing(timeout = 700) {
+  return new Promise(res => {
+    const on = ev => { if (ev.source === window && ev.data && ev.data.narez === "tiktok-reply" && ev.data.op === "pong") { removeEventListener("message", on); clearTimeout(tm); res(true); } };
+    const tm = setTimeout(() => { removeEventListener("message", on); res(false); }, timeout);
+    addEventListener("message", on);
+    window.postMessage({narez: "tiktok", op: "ping"}, "*");
+  });
+}
+function helperLogin(timeout = 70000) {
+  return new Promise(res => {
+    const on = ev => { if (ev.source === window && ev.data && ev.data.narez === "tiktok-reply" && ev.data.op === "login") { removeEventListener("message", on); clearTimeout(tm); res(ev.data); } };
+    const tm = setTimeout(() => { removeEventListener("message", on); res({ok: false, error: "Расширение не ответило"}); }, timeout);
+    addEventListener("message", on);
+    window.postMessage({narez: "tiktok", op: "login"}, "*");
+  });
+}
+async function ttLogin(a) {
+  if (!(await helperPing())) return dialog(h("div", {}, h("h3", {}, "Нужно расширение браузера"), h("div", {class: "muted"}, TT_EXT_HINT)), [{text: "Понятно", cls: "primary"}]);
+  try {
+    await api("POST", `/api/tiktok/accounts/${a.id}/arm`);
+    toast(`Вхожу в «${a.label}»: сброшу вход TikTok в этом браузере и открою страницу входа…`);
+    const r = await helperLogin();
+    if (!r.ok) return toast(r.error || "Не удалось войти", "err");
+    toast(r.clicked === false ? "Логин и пароль вписаны — нажми «Log in» сам" : "Данные введены. Если TikTok просит капчу или код — подтверди его сам");
+  } catch (e) { fail(e); }
+}
+function ttAccountDialog(a) {
+  const label = h("input", {type: "text", placeholder: "Например: «Мемы 1»", value: a ? a.label : ""});
+  const login = h("input", {type: "text", placeholder: "Email, телефон или имя пользователя", autocomplete: "off", value: a ? a.login : ""});
+  const pass = h("input", {type: "password", placeholder: a && a.has_password ? "уже сохранён — впиши новый, чтобы заменить" : "Пароль", autocomplete: "new-password"});
+  const note = h("textarea", {rows: 2, placeholder: "Заметка для себя: на какую почту/телефон приходят коды, прокси и т. п. (в TikTok не отправляется)"}, a ? a.note : "");
+  dialog(h("div", {}, h("h3", {}, a ? "TikTok-аккаунт" : "Новый TikTok-аккаунт"),
+      h("div", {class: "muted small", style: {marginBottom: "10px"}}, "Данные хранятся в базе narez на этом компьютере в открытом виде и никуда не отправляются — только в форму входа TikTok по кнопке «Войти»."),
+      h("label", {class: "muted small"}, "Название"), label, h("div", {style: {height: "8px"}}),
+      h("label", {class: "muted small"}, "Логин"), login, h("div", {style: {height: "8px"}}),
+      h("label", {class: "muted small"}, "Пароль"), pass, h("div", {style: {height: "8px"}}),
+      h("label", {class: "muted small"}, "Заметка"), note),
+    [{text: "Отмена", cls: "ghost"}, {text: "Сохранить", cls: "primary", fn: async () => {
+      try {
+        const body = {label: label.value, login: login.value, password: pass.value || undefined, note: note.value};
+        if (a) await api("PUT", `/api/tiktok/accounts/${a.id}`, body); else await api("POST", "/api/tiktok/accounts", body);
+        await loadTikTok(); render(); toast("Аккаунт сохранён");
+      } catch (e) { fail(e); } }}]);
+  setTimeout(() => label.focus(), 50);
+}
+function ttAccountsBlock() {
+  const T = S.tt || {accounts: []};
+  const badge = h("span", {class: "badge"}, "расширение: проверяю…");
+  helperPing().then(ok => { badge.className = "badge " + (ok ? "ok" : "warn"); badge.textContent = ok ? "расширение подключено" : "расширение не найдено"; badge.title = ok ? "" : TT_EXT_HINT; });
+  return h("div", {class: "card tt-block"}, h("h2", {}, "TikTok-аккаунты", h("small", {}, "для ручной выкладки, отдельно от групп")), 
+    h("div", {class: "row", style: {marginBottom: "6px"}}, badge, h("div", {class: "grow"}),
+      h("button", {class: "btn primary", onclick: () => ttAccountDialog(null)}, "+ Добавить аккаунт")),
+    T.accounts.length ? T.accounts.map(a => h("div", {class: "acc"},
+      h("div", {class: "plat tiktok"}, "TT"),
+      h("div", {class: "grow"}, h("b", {}, a.label), h("span", {class: "muted small"}, a.login + (a.note ? " · " + a.note : ""))),
+      h("button", {class: "btn sm primary", title: "Выйти из TikTok в этом браузере и войти в этот аккаунт", onclick: () => ttLogin(a)}, "Войти"),
+      h("button", {class: "btn sm", onclick: () => ttAccountDialog(a)}, "Изменить"),
+      h("button", {class: "btn sm danger", onclick: () => confirmBox("Удалить аккаунт?", `«${a.label}» и сохранённые данные входа будут удалены из narez.`, "Удалить", async () => {
+        try { await api("DELETE", `/api/tiktok/accounts/${a.id}`); await loadTikTok(); render(); } catch (e) { fail(e); } })}, "Убрать")))
+      : h("div", {class: "muted"}, "Аккаунтов нет. Добавь один раз логин и пароль — дальше вход в один клик."),
+    h("div", {class: "hint muted small", style: {marginTop: "10px"}}, "Кнопка «Войти» стирает вход TikTok (куки) в этом браузере, открывает страницу входа и вписывает данные. Капчу и код подтверждения вводишь сам. Автоматический вход нескольких аккаунтов с одного IP TikTok может счесть подозрительным — для надёжности держи аккаунты в отдельных профилях браузера или за разными прокси."));
+}
+async function ttCopy(text, label) {
+  try { await navigator.clipboard.writeText(text); toast(label ? `Скопировано: ${label}` : "Скопировано"); }
+  catch (e) { const t = h("textarea", {style: {position: "fixed", opacity: 0}}, text); document.body.append(t); t.select(); try { document.execCommand("copy"); toast(label ? `Скопировано: ${label}` : "Скопировано"); } catch (er) { fail(er); } t.remove(); }
+}
+async function ttCopyAll(c, useP) {
+  const path = useP ? c.path_preset : c.path_original;
+  // в буфер по очереди: путь, описание, название — в истории буфера Windows (Win+V) лежат все три, последним — название
+  try {
+    for (const t of [path, c.text, c.title]) { await navigator.clipboard.writeText(t); await new Promise(r => setTimeout(r, 250)); }
+    toast("Скопировано в буфер: путь к файлу, описание, название (Win+V — история буфера)");
+  } catch (e) { fail(new Error("Браузер не дал записать в буфер обмена: " + e.message)); }
+}
+function pageTikTok(page) {
+  const T = S.tt || (S.tt = {clips: [], accounts: []});
+  const list = h("div", {class: "tt-grid"});
+  const presetSel = h("select", {style: {minWidth: "240px"}});
+  const draw = () => {
+    presetSel.replaceChildren(h("option", {value: ""}, "— выбери пресет —"), ...(S.presets || []).map(p => h("option", {value: p.id}, p.name)));
+    if (S.ttPreset) presetSel.value = S.ttPreset;
+    const used = [...new Set(T.clips.map(c => c.preset).filter(Boolean))];
+    note.textContent = T.clips.length ? `Клипов: ${T.clips.length}. ` + (used.length ? `Сейчас применён пресет: ${used.join(", ")}.` : "Пресет не применён — у всех клипов только оригинал.") : "";
+    list.replaceChildren(...T.clips.map(ttCard));
+    del.hidden = !T.clips.length;
+    empty.hidden = !!T.clips.length;
+  };
+  const note = h("span", {class: "muted small grow"});
+  presetSel.onchange = () => { S.ttPreset = Number(presetSel.value) || null; };
+  const run = async (fn, okMsg) => { try { await fn(); } catch (e) { fail(e); } };
+  const apply = h("button", {class: "btn primary", onclick: () => run(async () => {
+    if (!S.ttPreset) return toast("Выбери пресет", "err");
+    const t = await api("POST", "/api/tiktok/preset", {preset_id: S.ttPreset}); startTracking(t); toast("Применяю пресет ко всем клипам… (прошлый вариант с пресетом будет удалён)"); }) }, "Применить к клипам");
+  const reset = h("button", {class: "btn", title: "Убрать последний пресет: останутся только оригиналы", onclick: () => run(async () => {
+    await api("POST", "/api/tiktok/reset"); await loadTikTok(); toast("Пресет убран, остались оригиналы"); render(); }) }, "Убрать пресет");
+  const del = h("button", {class: "btn danger", onclick: () => confirmBox("Удалить все клипы вкладки?", "Будут удалены и оригиналы, и клипы с последним пресетом (и исходное видео, если оно больше не нужно). Это освободит место на диске, вернуть файлы нельзя.", "Удалить всё", () => run(async () => {
+    const r = await api("DELETE", "/api/tiktok/clips"); await loadTikTok(); toast(`Удалено клипов: ${r.deleted}, освобождено ~${r.freed_mb} МБ`); render(); })) }, "Удалить все клипы и освободить место");
+  const empty = h("div", {class: "card empty"}, h("b", {}, "Здесь пока пусто"), "На «Панели» вставь ссылку и отметь «Для ручной выкладки в TikTok» — нарезанные клипы без баннера появятся здесь.",
+    h("div", {style: {marginTop: "14px"}}, h("button", {class: "btn primary", onclick: () => go("panel")}, "Перейти на «Панель»")));
+  page.append(h("div", {class: "card tt-block"}, h("h2", {}, "Пресет для всех клипов", h("small", {}, "оригинал + последний пресет, остальное удаляется")),
+      h("div", {class: "row", style: {gap: "10px", flexWrap: "wrap"}}, presetSel, apply, reset, note)),
+    empty, list, h("div", {class: "row", style: {justifyContent: "flex-end"}}, del));
+  draw();
+  api("GET", "/api/presets").then(p => { S.presets = p; draw(); }).catch(() => {});
+  loadTikTok().then(() => { if (S.page === "tiktok" && page.isConnected) { T.clips = S.tt.clips; draw(); } });
+}
+function ttCard(c) {
+  const hasP = c.has_preset_file;
+  let useP = hasP;
+  const video = h("video", {controls: true, playsinline: true, preload: "metadata", poster: `/api/clips/${c.id}/thumb`});
+  const setSrc = () => { video.src = `/api/clips/${c.id}/video?${useP ? "variant=final&" : ""}t=${Date.now()}`; };
+  setSrc();
+  const seg = h("div", {class: "seg"}, [["o", "Оригинал"], ["p", c.preset ? `С пресетом «${c.preset}»` : "С пресетом"]].map(([k, t]) =>
+    h("button", {"data-k": k, disabled: k === "p" && !hasP, class: (k === "p") === useP ? "on" : "", onclick: e => { useP = k === "p"; seg.querySelectorAll("button").forEach(b => b.classList.toggle("on", (b.dataset.k === "p") === useP)); setSrc(); }}, t)));
+  const title = h("input", {type: "text", value: c.title});
+  const desc = h("textarea", {rows: 5}, c.description);
+  const tags = h("input", {type: "text", value: c.tags, placeholder: "#теги"});
+  const save = async () => {
+    try { const r = await api("PATCH", `/api/clips/${c.id}`, {title: title.value, description: desc.value, tags: tags.value});
+      c.title = r.title; c.description = r.description; c.tags = r.tags; c.text = (r.description + (r.tags ? "\n\n" + r.tags : "")).trim(); } catch (e) { fail(e); }
+  };
+  [title, desc, tags].forEach(el => el.addEventListener("change", save));
+  const curPath = () => useP ? c.path_preset : c.path_original;
+  const full = () => (desc.value.trim() + (tags.value.trim() ? "\n\n" + tags.value.trim() : "")).trim();
+  return h("div", {class: "card tt-card"},
+    h("div", {class: "tt-frame"}, video),
+    h("div", {class: "tt-body"},
+      c.preset || hasP ? seg : h("div", {class: "muted small"}, "Только оригинал (пресет не применён)"),
+      h("label", {class: "muted small"}, "Название"), title,
+      h("label", {class: "muted small"}, "Описание"), desc,
+      h("label", {class: "muted small"}, "Теги"), tags,
+      h("div", {class: "muted small tt-path", title: "Путь к файлу"}, curPath()),
+      h("div", {class: "row", style: {gap: "6px", flexWrap: "wrap"}},
+        h("button", {class: "btn primary", onclick: async () => { await save(); ttCopyAll({...c, title: title.value, text: full(), path_original: c.path_original, path_preset: c.path_preset}, useP); }}, "Скопировать всё"),
+        h("button", {class: "btn sm", onclick: () => ttCopy(curPath(), "путь к файлу")}, "Путь"),
+        h("button", {class: "btn sm", onclick: () => ttCopy(full(), "описание")}, "Описание"),
+        h("button", {class: "btn sm", onclick: () => ttCopy(title.value, "название")}, "Название"),
+        h("div", {class: "grow"}),
+        h("button", {class: "btn sm danger", onclick: () => confirmBox("Удалить клип?", `«${c.title}» (оригинал и вариант с пресетом) будет удалён.`, "Удалить", async () => {
+          try { await api("DELETE", `/api/clips/${c.id}`); await loadTikTok(); render(); } catch (e) { fail(e); } })}, "Удалить"))));
+}
+
 async function init() {
   try { applyTheme(localStorage.getItem("theme")); } catch (e) {}
   $("#theme").onclick = () => {
@@ -1290,7 +1446,7 @@ async function init() {
   addEventListener("hashchange", render);
   try {
     [S.cfg, S.health] = await Promise.all([api("GET", "/api/config"), api("GET", "/api/health")]);
-    await loadGroups(); await loadClips(); await loadTemplates();
+    await loadGroups(); await loadClips(); await loadTemplates(); await loadTikTok();
   } catch (e) { fail(e); }
   renderHealth(); render(); pollTasks();
   setInterval(async () => { try { S.health = await api("GET", "/api/health"); renderHealth(); } catch (e) {} }, 15000);

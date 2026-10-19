@@ -101,7 +101,7 @@ def speech(video: Path, title: str, cfg: dict, log=print, subs_fallback: str = "
 
 def run(url: str, cfg: dict, db: dbm.DB, group_id: int | None = None, log=print, test: bool = False,
         mode: str = "moments", length: float = 45.0, overlap: float = 2.5, audio: str = "ru",
-        adcut_sb: bool | None = None, adcut_text: bool | None = None, subs_fallback: str = "youtube"):
+        adcut_sb: bool | None = None, adcut_text: bool | None = None, subs_fallback: str = "youtube", tiktok: bool = False):
     """Ссылка -> скачивание -> транскрипт -> моменты -> готовые вертикальные клипы. Возвращает (job_id, [clips]).
     mode="full": без выбора моментов — всё видео режется подряд на части длиной length с нахлёстом overlap."""
     if mode == "full":
@@ -158,7 +158,7 @@ def run(url: str, cfg: dict, db: dbm.DB, group_id: int | None = None, log=print,
         # кодирование чуть быстрее (файл немного больше). Вернуть можно в config.toml: [subtitles] llm_fix_full = true, [clips] full_preset = "veryfast"
         render_cfg["clips"] = {**cfg["clips"], "preset": cfg["clips"].get("full_preset", "superfast")}
         sub_cfg = {**cfg, "subtitles": {**cfg["subtitles"], "llm_fix": bool(cfg["subtitles"].get("llm_fix_full", False))}}
-    spec = config_spec(cfg)
+    spec = None if tiktok else config_spec(cfg)   # для ручной выкладки в TikTok клипы остаются без баннера
     banner_json = json.dumps(spec, ensure_ascii=False) if spec else ""
     width = max(2, len(str(len(moments))))
     for i, m in enumerate(moments, 1):
@@ -185,7 +185,9 @@ def run(url: str, cfg: dict, db: dbm.DB, group_id: int | None = None, log=print,
         body, tags = split_hashtags(m.reason)  # хэштеги храним отдельно, чтобы их можно было править
         m.reason = body
         thumb = make_thumb(out, workdir / "thumbs" / f"job{job_id}_{i:02d}.png")
-        db.add_clip(job_id, str(out), m, tags=tags, banner=banner_json, thumb=str(thumb or ""))
+        cid = db.add_clip(job_id, str(out), m, tags=tags, banner=banner_json, thumb=str(thumb or ""))
+        if tiktok:
+            db.update_clip(cid, status="tiktok")
     tm.report()
     log("Готово!")
     return job_id, db.clips(job_id)

@@ -91,3 +91,12 @@ def finish_group(db, cfg: dict, group_id: int, log=print, delete_sources: bool =
     if freed:
         log(f"Освобождено места: {freed / 1e6:.0f} МБ (исходники и готовые клипы удалены после публикации).")
     return freed
+
+
+def sweep_sources(db, cfg: dict) -> int:
+    """Удаляет исходники заданий, в которых не осталось клипов в работе. Возвращает освобождённые байты."""
+    freed = 0
+    for job in db.jobs_with_source(None):
+        if db.clip_count(job["id"]) > 0 and db.open_clip_count(job["id"]) == 0:
+            freed += _drop_source(db, job, cfg["paths"]["workdir"])
+    return freed

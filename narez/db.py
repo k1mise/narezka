@@ -20,6 +20,9 @@ CREATE TABLE IF NOT EXISTS clips(
   id INTEGER PRIMARY KEY, job_id INTEGER REFERENCES jobs(id) ON DELETE CASCADE,
   path TEXT, start REAL, end REAL, title TEXT, reason TEXT, score REAL,
   status TEXT DEFAULT 'ready');
+CREATE TABLE IF NOT EXISTS tiktok_accounts(
+  id INTEGER PRIMARY KEY, label TEXT NOT NULL, login TEXT DEFAULT '', password TEXT DEFAULT '', note TEXT DEFAULT '',
+  created TEXT DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE IF NOT EXISTS presets(id INTEGER PRIMARY KEY, name TEXT UNIQUE NOT NULL, data TEXT DEFAULT '{}');
 CREATE TABLE IF NOT EXISTS templates(id INTEGER PRIMARY KEY, name TEXT UNIQUE NOT NULL, data TEXT DEFAULT '{}');
 CREATE TABLE IF NOT EXISTS proxies(
@@ -41,10 +44,10 @@ MIGRATIONS = {
     "jobs": {"source_path": "TEXT DEFAULT ''", "test": "INTEGER DEFAULT 0"},
     "clips": {"group_id": "INTEGER", "tags": "TEXT DEFAULT ''", "banner": "TEXT DEFAULT ''", "banner_applied": "TEXT DEFAULT ''",
               "final_path": "TEXT DEFAULT ''", "thumb": "TEXT DEFAULT ''", "publish_at": "TEXT DEFAULT ''",
-              "filler": "TEXT DEFAULT ''", "filler_path": "TEXT DEFAULT ''", "filler_applied": "TEXT DEFAULT ''"},
+              "filler": "TEXT DEFAULT ''", "filler_path": "TEXT DEFAULT ''", "filler_applied": "TEXT DEFAULT ''", "tt_preset": "TEXT DEFAULT ''"},
     "publications": {"avg_pct": "REAL", "avg_sec": "REAL"},    # удержание: средний % досмотра и средняя длительность просмотра (YouTube Analytics)
 }
-CLIP_FIELDS = {"group_id", "path", "title", "reason", "tags", "banner", "banner_applied", "final_path", "thumb", "status", "publish_at", "filler", "filler_path", "filler_applied"}
+CLIP_FIELDS = {"group_id", "path", "title", "reason", "tags", "banner", "banner_applied", "final_path", "thumb", "status", "publish_at", "filler", "filler_path", "filler_applied", "tt_preset"}
 
 
 class DB:
@@ -165,6 +168,29 @@ class DB:
         self.c.commit()
         return cur.lastrowid
 
+    # --- TikTok: ручная выкладка ---
+    def tiktok_clips(self):
+        return self.c.execute("SELECT * FROM clips WHERE status='tiktok' ORDER BY id").fetchall()
+
+    def tiktok_accounts(self):
+        return self.c.execute("SELECT * FROM tiktok_accounts ORDER BY id").fetchall()
+
+    def tiktok_account(self, acc_id: int):
+        return self.c.execute("SELECT * FROM tiktok_accounts WHERE id=?", (acc_id,)).fetchone()
+
+    def save_tiktok_account(self, label: str, login: str, password: str, note: str, acc_id: int | None = None) -> int:
+        if acc_id:
+            self.c.execute("UPDATE tiktok_accounts SET label=?, login=?, password=?, note=? WHERE id=?", (label, login, password, note, acc_id))
+            self.c.commit()
+            return acc_id
+        cur = self.c.execute("INSERT INTO tiktok_accounts(label,login,password,note) VALUES(?,?,?,?)", (label, login, password, note))
+        self.c.commit()
+        return cur.lastrowid
+
+    def delete_tiktok_account(self, acc_id: int):
+        self.c.execute("DELETE FROM tiktok_accounts WHERE id=?", (acc_id,))
+        self.c.commit()
+
     def clips(self, job_id: int):
         return self.c.execute("SELECT * FROM clips WHERE job_id=? ORDER BY start", (job_id,)).fetchall()
 
@@ -198,7 +224,7 @@ class DB:
         return job["group_id"] if job else None
 
     def open_clip_count(self, job_id: int) -> int:
-        return self.c.execute("SELECT COUNT(*) FROM clips WHERE job_id=? AND status='ready'", (job_id,)).fetchone()[0]
+        return self.c.execute("SELECT COUNT(*) FROM clips WHERE job_id=? AND status IN ('ready','tiktok')", (job_id,)).fetchone()[0]
 
     def clip_count(self, job_id: int) -> int:
         return self.c.execute("SELECT COUNT(*) FROM clips WHERE job_id=?", (job_id,)).fetchone()[0]

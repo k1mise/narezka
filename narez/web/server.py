@@ -20,7 +20,7 @@ from pydantic import BaseModel
 from .. import banner as bn
 from .. import filler as filler_mod
 from .. import schedule, service
-from ..cleanup import discard_clip
+from ..cleanup import discard_clip, sweep_sources
 from ..config import FOLDER_TITLES, folder, load_config
 from ..editor import make_thumb
 from ..db import DB, PLATFORMS
@@ -91,6 +91,7 @@ class ProcessIn(CutIn):
     group_id: int = 0
     test: bool = False
     template_id: Optional[int] = None   # шаблон: клипы уходят во все его группы, каждая со своим пресетом баннеров
+    tiktok: bool = False                # клипы для ручной выкладки в TikTok: без баннера, группа и шаблон не нужны
 
 
 class ProxyAddIn(BaseModel):
@@ -109,6 +110,17 @@ class PresetIn(BaseModel):
     banners: Optional[list[dict]] = None
     tags: str = ""
     footer: str = ""
+
+
+class TikTokAccountIn(BaseModel):
+    label: str
+    login: str = ""
+    password: Optional[str] = None      # None/пусто при правке — оставить прежний пароль
+    note: str = ""
+
+
+class TikTokPresetIn(BaseModel):
+    preset_id: int
 
 
 class ApplyIn(BaseModel):
@@ -457,20 +469,25 @@ def create_app(cfg: dict | None = None) -> FastAPI:
     # ---------- нарезка ----------
     @app.post("/api/process")
     def process(body: ProcessIn, d: DB = Depends(get_db)):
-        gid, plan = resolve_target(d, body.group_id, body.template_id)
+        if body.tiktok:
+            gid, plan = None, []
+        else:
+            gid, plan = resolve_target(d, body.group_id, body.template_id)
         try:
             url = normalize_source(body.url)
         except SourceError as e:
             raise HTTPException(400, str(e)) from None
 
         cut = cut_args(body)
+        if body.tiktok:
+            cut["tiktok"] = True
 
         def fn(log):
             db2 = DB(cfg["paths"]["db"], init=False)
-            job_id, clips = run_pipeline(url, eff_cfg(db2, log), db2, gid, log, test=body.test, **cut)
+            job_id, clips = run_pipeline(url, eff_cfg(db2, log), db2, gid, log, test=body.test and not body.tiktok, **cut)
             fan_out(db2, job_id, plan, log)
             return {"job_id": job_id, "clips": len(clips) * max(1, len(plan))}
-        return started("process", f"{'Тест: ' if body.test else 'Нарезка целиком: ' if body.mode == 'full' else 'Нарезка: '}{Path(url).name if not url.startswith('http') else url}", fn, exclusive=True)
+        return started("process", f"{'TikTok: ' if body.tiktok else 'Тест: ' if body.test else 'Нарезка целиком: ' if body.mode == 'full' else 'Нарезка: '}{Path(url).name if not url.startswith('http') else url}", fn, exclusive=True)
 
     @app.get("/api/tasks")
     def task_list():
@@ -825,6 +842,161 @@ def create_app(cfg: dict | None = None) -> FastAPI:
                 for cid in ids:
                     d.update_clip(cid, tags=normalize_tags(extra + " " + (d.clip(cid)["tags"] or "")))
             log(f"Группа «{g['name']}»: {len(ids)} клип(ов)" + (f", пресет «{pr['name']}»" if pr else "") + (f", теги {extra}" if extra else ""))
+
+    # ---------- TikTok: ручная выкладка ----------
+    tt_armed: dict = {}      # account_id -> время, до которого расширение может забрать данные для входа (один раз)
+
+    def tt_clip_json(c, d: DB) -> dict:
+        j = clip_json(c, d)
+        try:
+            pre = json.loads(c["tt_preset"] or "{}")
+        except ValueError:
+            pre = {}
+        fin = bn.cached_final(c, cfg)
+        orig = str(Path(c["path"]).resolve()) if c["path"] else ""
+        j.update(preset=pre.get("name", ""), preset_id=pre.get("id"), has_preset_file=bool(fin),
+                 path_original=orig, path_preset=str(Path(fin).resolve()) if fin else "",
+                 text=(j["description"] + ("\n\n" + j["tags"] if j["tags"] else "")).strip())
+        return j
+
+    @app.get("/api/tiktok/clips")
+    def tt_clips(d: DB = Depends(get_db)):
+        return [tt_clip_json(c, d) for c in d.tiktok_clips()]
+
+    def tt_strip_preset(c) -> dict:
+        """Поля клипа без текста прежнего пресета (его теги и подпись), баннер и готовый файл убираются."""
+        try:
+            old = json.loads(c["tt_preset"] or "{}")
+        except ValueError:
+            old = {}
+        upd = {}
+        if old.get("footer"):
+            upd["reason"] = (c["reason"] or "").replace("\n\n" + old["footer"], "").replace(old["footer"], "").strip()
+        if old.get("tags"):
+            drop = {t.lower() for t in old["tags"].split()}
+            upd["tags"] = " ".join(t for t in (c["tags"] or "").split() if t.lower() not in drop)
+        fin = c["final_path"]
+        if fin and fin != c["path"]:
+            try:
+                if Path(fin).is_file() and Path(fin).resolve().is_relative_to(wd.resolve()):
+                    Path(fin).unlink()
+            except OSError:
+                pass
+        upd.update(banner="", final_path="", banner_applied="", tt_preset="")
+        return upd
+
+    @app.post("/api/tiktok/preset")
+    def tt_apply_preset(body: TikTokPresetIn, d: DB = Depends(get_db)):
+        """Пресет применяется ко всем клипам вкладки; прежний пресет и его файлы удаляются (остаются оригинал и последний пресет)."""
+        r = d.preset(body.preset_id)
+        if not r:
+            raise HTTPException(404, "Пресет не найден")
+        pr = preset_json(r)
+        try:
+            spec = preset_banner_spec(pr)
+        except ValueError as e:
+            raise HTTPException(400, str(e)) from None
+        ids = [c["id"] for c in d.tiktok_clips()]
+        if not ids:
+            raise HTTPException(400, "Во вкладке нет клипов")
+
+        def fn(log):
+            db2 = DB(cfg["paths"]["db"], init=False)
+            for n, cid in enumerate(ids, 1):
+                c = db2.clip(cid)
+                if not c or c["status"] != "tiktok":
+                    continue
+                upd = tt_strip_preset(c)
+                if pr["tags"]:
+                    upd["tags"] = normalize_tags((upd.get("tags", c["tags"]) or "") + " " + pr["tags"])
+                if pr["footer"]:
+                    base = upd.get("reason", c["reason"]) or ""
+                    upd["reason"] = (base.rstrip() + "\n\n" + pr["footer"]).strip()
+                if spec:
+                    upd["banner"] = spec
+                upd["tt_preset"] = json.dumps({"id": pr["id"], "name": pr["name"], "tags": pr["tags"], "footer": pr["footer"]}, ensure_ascii=False)
+                db2.update_clip(cid, **upd)
+                if spec:
+                    log(f"Клип {n}/{len(ids)}: накладываю пресет «{pr['name']}»...")
+                    bn.ensure_final(db2, db2.clip(cid), cfg, log)
+            return {"clips": len(ids), "preset": pr["name"]}
+        return started("tiktok-preset", f"TikTok: пресет «{pr['name']}»", fn)
+
+    @app.post("/api/tiktok/reset")
+    def tt_reset(d: DB = Depends(get_db)):
+        """Убирает последний пресет: остаются только оригиналы."""
+        n = 0
+        for c in d.tiktok_clips():
+            d.update_clip(c["id"], **tt_strip_preset(c))
+            n += 1
+        return {"clips": n}
+
+    @app.delete("/api/tiktok/clips")
+    def tt_delete_all(d: DB = Depends(get_db)):
+        """Очистка хранилища: удаляются и оригиналы, и клипы с последним пресетом, а затем исходные видео."""
+        n = 0
+        for c in d.tiktok_clips():
+            discard_clip(d, cfg, c["id"])
+            n += 1
+        freed = sweep_sources(d, cfg)
+        return {"deleted": n, "freed_mb": round(freed / 1e6)}
+
+    def tt_account_json(r) -> dict:
+        return {"id": r["id"], "label": r["label"], "login": r["login"], "has_password": bool(r["password"]), "note": r["note"]}
+
+    @app.get("/api/tiktok/accounts")
+    def tt_accounts(d: DB = Depends(get_db)):
+        return [tt_account_json(r) for r in d.tiktok_accounts()]
+
+    @app.post("/api/tiktok/accounts")
+    def tt_account_add(body: TikTokAccountIn, d: DB = Depends(get_db)):
+        label = body.label.strip()
+        if not label:
+            raise HTTPException(400, "Дай аккаунту название")
+        if not body.login.strip() or not body.password:
+            raise HTTPException(400, "Нужны логин и пароль")
+        return tt_account_json(d.tiktok_account(d.save_tiktok_account(label, body.login.strip(), body.password, body.note.strip())))
+
+    @app.put("/api/tiktok/accounts/{acc_id}")
+    def tt_account_edit(acc_id: int, body: TikTokAccountIn, d: DB = Depends(get_db)):
+        r = d.tiktok_account(acc_id)
+        if not r:
+            raise HTTPException(404, "Аккаунт не найден")
+        label = body.label.strip()
+        if not label:
+            raise HTTPException(400, "Дай аккаунту название")
+        d.save_tiktok_account(label, body.login.strip(), body.password or r["password"], body.note.strip(), acc_id)
+        return tt_account_json(d.tiktok_account(acc_id))
+
+    @app.delete("/api/tiktok/accounts/{acc_id}")
+    def tt_account_del(acc_id: int, d: DB = Depends(get_db)):
+        if not d.tiktok_account(acc_id):
+            raise HTTPException(404, "Аккаунт не найден")
+        d.delete_tiktok_account(acc_id)
+        return {"ok": True}
+
+    @app.post("/api/tiktok/accounts/{acc_id}/arm")
+    def tt_account_arm(acc_id: int, d: DB = Depends(get_db)):
+        """Страница нажала «Войти»: на 60 секунд разрешаем расширению один раз забрать данные этого аккаунта."""
+        if not d.tiktok_account(acc_id):
+            raise HTTPException(404, "Аккаунт не найден")
+        tt_armed.clear()
+        tt_armed[acc_id] = time.time() + 60
+        return {"ok": True}
+
+    @app.get("/api/tiktok/pending")
+    def tt_pending(request: Request, d: DB = Depends(get_db)):
+        """Только для расширения: заголовок X-Narez-Helper (чужая страница не может его отправить без CORS-разрешения),
+        данные отдаются один раз и только после нажатия «Войти» в интерфейсе."""
+        if request.headers.get("x-narez-helper") != "1":
+            raise HTTPException(403, "Только для расширения narez")
+        now = time.time()
+        for acc_id, until in list(tt_armed.items()):
+            tt_armed.pop(acc_id, None)
+            r = d.tiktok_account(acc_id)
+            if r and until >= now:
+                return {"label": r["label"], "login": r["login"], "password": r["password"]}
+        raise HTTPException(404, "Нет ожидающего входа")
 
     # ---------- папки и файлы ----------
     VIDEO_EXT = {".mp4", ".mkv", ".mov", ".webm", ".m4v", ".avi", ".flv", ".ts", ".mpg", ".mpeg", ".wmv"}

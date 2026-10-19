@@ -1059,3 +1059,92 @@ def test_task_log_drops_tasks_older_than_7_days(tmp_path):
     assert not (store / "old.json").exists() and not (store / "old.log").exists()
     tm.get("new").finished = now - 9 * 86400
     assert [t.id for t in tm.recent()] == [] and not (store / "new.json").exists()
+
+
+# ---------- TikTok: ручная выкладка ----------
+def _tt_clip(db, cfg, n=1):
+    j = db.add_job(None, "u", "Исходник")
+    p = cfg["paths"]["workdir"] / "clips" / f"tt{n}.mp4"
+    _mk_video(p)
+    cid = db.add_clip(j, str(p), Moment(0, 40, f"Клип {n}", "Описание", 5), tags="#a")
+    db.update_clip(cid, status="tiktok")
+    return cid
+
+
+def test_process_tiktok_flag_passes_through(env, monkeypatch):
+    c, cfg, db, _ = env
+    got = {}
+    monkeypatch.setattr("narez.web.server.run_pipeline", lambda src, cfg_, db_, gid, log, **k: got.update(gid=gid, **k) or (1, []))
+    t = c.post("/api/process", json={"url": "https://x.y/v", "tiktok": True, "test": True}).json()    # группа не нужна
+    assert wait_task(c, t)["status"] == "done"
+    assert got["gid"] is None and got["tiktok"] is True and got["test"] is False
+
+
+def test_tiktok_clips_preset_variants_and_cleanup(env):
+    c, cfg, db, _ = env
+    g = db.add_group("g")
+    ready = add_clip(db, cfg, g, "Обычный", 9)
+    c1, c2 = _tt_clip(db, cfg, 1), _tt_clip(db, cfg, 2)
+    assert {x["id"] for x in c.get("/api/tiktok/clips").json()} == {c1, c2}            # обычные клипы не попадают
+    assert ready not in {x["id"] for x in c.get("/api/tiktok/clips").json()}
+    bdir = cfg["paths"]["workdir"] / "banners"
+    bdir.mkdir(exist_ok=True)
+    _png(bdir / "a.png")
+    _png(bdir / "b.png", "blue")
+    pa = c.post("/api/presets", json={"name": "A", "banner": {"name": "a.png", "start": 0, "duration": 1}, "tags": "#рекл", "footer": "Подпись A"}).json()
+    pb = c.post("/api/presets", json={"name": "B", "banner": {"name": "b.png", "start": 0, "duration": 1}, "tags": "#другой", "footer": "Подпись B"}).json()
+    t = wait_task(c, c.post("/api/tiktok/preset", json={"preset_id": pa["id"]}).json(), 60)
+    assert t["status"] == "done", t
+    items = {x["id"]: x for x in c.get("/api/tiktok/clips").json()}
+    x = items[c1]
+    assert x["preset"] == "A" and x["has_preset_file"] and x["path_preset"] != x["path_original"]
+    assert Path(x["path_original"]).exists() and Path(x["path_preset"]).exists()
+    assert "Подпись A" in x["description"] and "#рекл" in x["tags"]
+    first_preset_file = x["path_preset"]
+    # второй пресет: версия прежнего удаляется, текст прежнего не копится
+    t = wait_task(c, c.post("/api/tiktok/preset", json={"preset_id": pb["id"]}).json(), 60)
+    assert t["status"] == "done", t
+    y = {x["id"]: x for x in c.get("/api/tiktok/clips").json()}[c1]
+    assert y["preset"] == "B" and "Подпись B" in y["description"] and "Подпись A" not in y["description"]
+    assert "#другой" in y["tags"] and "#рекл" not in y["tags"] and "#a" in y["tags"]
+    assert Path(y["path_original"]).exists()
+    assert not Path(first_preset_file).exists() or first_preset_file == y["path_preset"]   # тот же путь, но файл пересобран
+    # preview-видео отдаётся для обоих вариантов
+    assert c.get(f"/api/clips/{c1}/video").status_code == 200 and c.get(f"/api/clips/{c1}/video?variant=final").status_code == 200
+    # сброс: остаётся только оригинал
+    assert c.post("/api/tiktok/reset").json()["clips"] == 2
+    z = {x["id"]: x for x in c.get("/api/tiktok/clips").json()}[c1]
+    assert z["preset"] == "" and not z["has_preset_file"] and "Подпись" not in z["description"] and Path(z["path_original"]).exists()
+    # применили снова и удалили всё
+    wait_task(c, c.post("/api/tiktok/preset", json={"preset_id": pa["id"]}).json(), 60)
+    files = [Path(v["path_original"]) for v in c.get("/api/tiktok/clips").json()] + [Path(v["path_preset"]) for v in c.get("/api/tiktok/clips").json()]
+    assert all(f.exists() for f in files)
+    r = c.delete("/api/tiktok/clips").json()
+    assert r["deleted"] == 2 and not any(f.exists() for f in files)
+    assert c.get("/api/tiktok/clips").json() == []
+    assert db.clip(ready)["status"] == "ready"          # обычная очередь не тронута
+    assert c.post("/api/tiktok/preset", json={"preset_id": pa["id"]}).status_code == 400   # клипов нет
+    assert c.post("/api/tiktok/preset", json={"preset_id": 999}).status_code == 404
+
+
+def test_tiktok_accounts_and_one_time_helper_login(env):
+    c, cfg, db, _ = env
+    assert c.post("/api/tiktok/accounts", json={"label": "", "login": "a", "password": "b"}).status_code == 400
+    assert c.post("/api/tiktok/accounts", json={"label": "Мемы", "login": "a@b.c"}).status_code == 400
+    a = c.post("/api/tiktok/accounts", json={"label": "Мемы", "login": "a@b.c", "password": "секрет", "note": "код на почту"}).json()
+    assert "password" not in a and a["has_password"] is True
+    assert "секрет" not in c.get("/api/tiktok/accounts").text
+    # без «Войти» в интерфейсе и без заголовка расширения данные не выдаются
+    assert c.get("/api/tiktok/pending").status_code == 403
+    assert c.get("/api/tiktok/pending", headers={"X-Narez-Helper": "1"}).status_code == 404
+    assert c.post(f"/api/tiktok/accounts/{a['id']}/arm").status_code == 200
+    r = c.get("/api/tiktok/pending", headers={"X-Narez-Helper": "1"}).json()
+    assert r == {"label": "Мемы", "login": "a@b.c", "password": "секрет"}
+    assert c.get("/api/tiktok/pending", headers={"X-Narez-Helper": "1"}).status_code == 404     # одноразово
+    # чужой Host по-прежнему блокируется
+    c.post(f"/api/tiktok/accounts/{a['id']}/arm")
+    assert c.get("/api/tiktok/pending", headers={"X-Narez-Helper": "1", "host": "evil.com"}).status_code == 403
+    # правка без пароля оставляет прежний
+    c.put(f"/api/tiktok/accounts/{a['id']}", json={"label": "Мемы 2", "login": "x@y.z"})
+    assert db.tiktok_account(a["id"])["password"] == "секрет" and db.tiktok_account(a["id"])["label"] == "Мемы 2"
+    assert c.delete(f"/api/tiktok/accounts/{a['id']}").status_code == 200 and c.get("/api/tiktok/accounts").json() == []
