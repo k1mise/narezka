@@ -753,3 +753,44 @@ def test_visual_story_starts_on_real_video(tmp_path):
     flt = "drawbox=x=20:y=10:w=500:h=110:color=black:t=fill:enable='between(t,5,15)+between(t,25,35)'"
     subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", "color=c=white:s=640x360:r=10:d=40", "-vf", flt, "-pix_fmt", "yuv420p", str(out)], check=True)
     assert [round(x) for x in visual.story_starts(out)] in ([5, 25], [6, 26])
+
+
+def test_browser_find_and_open(monkeypatch, tmp_path):
+    from narez import browser
+    exe = tmp_path / "mybrowser.exe"
+    exe.write_text("x")
+    assert browser.find(str(exe)) == str(exe)
+    assert browser.find("") is None and browser.find("default") is None
+    monkeypatch.setattr(browser.shutil, "which", lambda c: f"/bin/{c}" if c == "msedge" else None)
+    assert browser.find("Edge") == "/bin/msedge" and browser.find("Microsoft Edge") == "/bin/msedge"
+    assert browser.find("nonexistent-browser") is None
+    calls = []
+    monkeypatch.setattr(browser.subprocess, "Popen", lambda cmd, **k: calls.append(cmd))
+    monkeypatch.setattr(browser.webbrowser, "open", lambda u: calls.append(["default", u]))
+    logs = []
+    assert browser.open_url("http://x/", str(exe), logs.append) is True and calls[-1] == [str(exe), "http://x/"]
+    assert browser.open_url("http://x/", "nonexistent-browser", logs.append) is False and calls[-1] == ["default", "http://x/"] and logs
+    assert browser.open_url("http://x/", "", logs.append) is False and calls[-1] == ["default", "http://x/"]
+
+
+def test_browser_profiles(monkeypatch, tmp_path):
+    import json
+    from narez import browser
+    ud = tmp_path / "User Data"
+    ud.mkdir()
+    (ud / "Local State").write_text(json.dumps({"profile": {"info_cache": {
+        "Default": {"name": "Личный", "user_name": "me@gmail.com"},
+        "Profile 3": {"name": "Работа", "user_name": "Tiktok.Acc@gmail.com"}}}}), encoding="utf-8")
+    assert [p["dir"] for p in browser.profiles("chrome", str(ud))] == ["Default", "Profile 3"]
+    assert browser.find_profile("tiktok.acc@gmail.com", "chrome", str(ud)) == "Profile 3"      # по почте без учёта регистра
+    assert browser.find_profile("Работа", "chrome", str(ud)) == "Profile 3" and browser.find_profile("default", "chrome", str(ud)) == "Default"
+    assert browser.find_profile("нет такого", "chrome", str(ud)) is None and browser.find_profile("", "chrome", str(ud)) is None
+    exe = tmp_path / "chrome.exe"
+    exe.write_text("x")
+    monkeypatch.setitem(browser.USER_DATA, "chrome", str(ud))
+    calls, logs = [], []
+    monkeypatch.setattr(browser.subprocess, "Popen", lambda cmd, **k: calls.append(cmd))
+    monkeypatch.setattr(browser.webbrowser, "open", lambda u: calls.append(["default", u]))
+    assert browser.open_url("http://x/", str(exe), logs.append, "tiktok.acc@gmail.com") is True
+    assert calls[-1] == [str(exe), "--profile-directory=Profile 3", "http://x/"]
+    assert browser.open_url("http://x/", str(exe), logs.append, "нет такого") is True and calls[-1] == [str(exe), "http://x/"] and "Profile 3" in logs[-1]

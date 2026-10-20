@@ -158,6 +158,10 @@ async function loadTikTok() {
   catch (e) { S.tt = S.tt || {clips: [], accounts: []}; }
   renderNav();
 }
+async function loadStickers() {
+  try { S.stickerLib = await api("GET", "/api/stickers"); } catch (e) { S.stickerLib = S.stickerLib || {dir: "", screen_mm: 67, defaults: {}, files: []}; }
+  try { S.stickerPresets = await api("GET", "/api/sticker-presets"); } catch (e) { S.stickerPresets = S.stickerPresets || []; }
+}
 async function loadBanners() { S.banners = await api("GET", "/api/banners"); }
 async function loadFillers() { try { S.fillers = await api("GET", "/api/fillers"); } catch (e) { S.fillers = S.fillers || {dir: "", files: []}; } }
 const FILLER_POS = {"": "Без вставки", bottom: "Вставка снизу", top: "Вставка сверху"};
@@ -534,6 +538,25 @@ function fillerCard(c) {
   return h("div", {class: "card"}, h("h2", {}, "Видео-вставка", h("small", {}, "собирается при публикации; «Точный предпросмотр» покажет результат")),
     h("div", {class: "field"}, h("label", {}, "Расположение"), pos), h("div", {class: "field"}, h("label", {}, "Какое видео"), file), hint);
 }
+function stickerCard(c) {
+  const L = S.stickerPresets || [];
+  const sel = h("select", {style: {width: "100%"}}, L.length ? L.map(p => h("option", {value: p.id}, p.name)) : [h("option", {value: ""}, "— пресетов стикеров пока нет —")]);
+  if (S.stickerPresetId && L.some(p => p.id === S.stickerPresetId)) sel.value = S.stickerPresetId;
+  sel.onchange = () => { S.stickerPresetId = Number(sel.value) || null; };
+  const go_ = async (ids, text) => {
+    const p = L.find(x => x.id === Number(sel.value)); if (!p) return toast("Сначала выбери пресет стикеров", "err");
+    try { await api("POST", `/api/sticker-presets/${p.id}/apply`, {clip_ids: ids}); await loadClips(); toast(`Стикеры «${p.name}» добавлены: ${text}`); render(); } catch (e) { fail(e); }
+  };
+  const cur = c.stickers;
+  return h("div", {class: "card"}, h("h2", {}, "Стикеры", h("small", {}, "мелкие картинки поверх клипа; собираются при публикации")),
+    cur ? h("div", {class: "note", style: {marginBottom: "10px"}}, `Сейчас: «${cur.preset || "стикеры"}», штук: ${cur.items.length}, размер ≈ ${cur.size_mm} мм. Повторное применение расставит их заново.`) : null,
+    h("div", {class: "field"}, sel),
+    h("div", {class: "sticky-actions"},
+      h("button", {class: "btn", disabled: !L.length, onclick: () => go_([c.id], "этот клип")}, "Применить к клипу"),
+      h("button", {class: "btn", disabled: !L.length, onclick: () => go_(S.clips.filter(x => x.group_id === c.group_id).map(x => x.id), `все клипы группы «${c.group}»`)}, "Ко всем клипам группы"),
+      h("button", {class: "btn", disabled: !cur, onclick: async () => { try { await api("PATCH", `/api/clips/${c.id}`, {stickers: {}}); await loadClips(); toast("Стикеры убраны"); render(); } catch (e) { fail(e); } }}, "Убрать стикеры"),
+      h("button", {class: "btn", onclick: () => { S.presetTab = "stickers"; try { localStorage.setItem("presetTab", "stickers"); } catch (e) {} go("presets"); }}, "Пресеты стикеров…")));
+}
 function pageEditor(page) {
   if (!S.fillers) loadFillers().then(() => { if (S.page === "editor") render(); });
   if (!S.groups.length || !S.clips.length) {
@@ -567,6 +590,9 @@ async function buildEditor(root) {
   video.addEventListener("error", () => toast("Браузер не смог загрузить видео клипа (превью-кадр при этом виден).", "err"));
   const frame = h("div", {class: "frame"}, video);
   const ov = h("div", {class: "bn-ov"}); frame.append(ov);
+  const stkOv = h("div", {class: "stk-ov"}, ((c.stickers && c.stickers.items) || []).map(it => h("img", {class: "stk", src: "/api/stickers/file?name=" + encodeURIComponent(it.file), alt: "",
+    style: {left: (it.x * 100) + "%", top: (100 - it.y) + "%", width: ((c.stickers.size_mm || 4) / ((S.stickerLib && S.stickerLib.screen_mm) || 67) * 100) + "%", transform: `translate(-50%,-50%) rotate(${it.angle || 0}deg)`}})));
+  frame.append(stkOv);
   if (!document.getElementById("nz-key-svg")) {   // фильтр «зелёный → прозрачный» для живого предпросмотра (точный результат — в рендере)
     const wrap = document.createElement("div"); wrap.id = "nz-key-svg"; wrap.style.cssText = "position:absolute;width:0;height:0;overflow:hidden";
     wrap.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" width="0" height="0"><filter id="nz-key" x="0" y="0" width="100%" height="100%" color-interpolation-filters="sRGB">'
@@ -581,12 +607,12 @@ async function buildEditor(root) {
   const pvBtn = h("button", {class: "btn", onclick: preview}, "Точный предпросмотр (рендер)");
   async function preview() {
     if (!live) {   // вернуться к быстрому предпросмотру
-      live = true; video.src = `/api/clips/${c.id}/video?t=${Date.now()}`; pvBtn.textContent = "Точный предпросмотр (рендер)"; return;
+      live = true; stkOv.style.display = ""; video.src = `/api/clips/${c.id}/video?t=${Date.now()}`; pvBtn.textContent = "Точный предпросмотр (рендер)"; return;
     }
     try {
       await save(true);
       const curClip = S.clips.find(x => x.id === c.id) || c;
-      if (!specsNow().length && !(curClip.filler && curClip.filler.position)) return toast("Ни баннер, ни видео-вставка не выбраны", "err");
+      if (!specsNow().length && !(curClip.filler && curClip.filler.position) && !curClip.stickers) return toast("Ни баннер, ни видео-вставка, ни стикеры не выбраны", "err");
       pvBtn.disabled = true; pvBtn.textContent = "Собираю предпросмотр…";
       const t = await api("POST", `/api/clips/${c.id}/preview`); startTracking(t);
       for (;;) {
@@ -596,7 +622,7 @@ async function buildEditor(root) {
         if (s.status === "error") throw new Error(s.error);
         break;
       }
-      live = false; hideOv();
+      live = false; hideOv(); stkOv.style.display = "none";
       video.src = `/api/clips/${c.id}/video?variant=final&t=${Date.now()}`; video.play().catch(() => {});
       pvBtn.disabled = false; pvBtn.textContent = "Вернуться к быстрому предпросмотру"; return;
     } catch (e) { fail(e); }
@@ -937,6 +963,7 @@ async function buildEditor(root) {
       h("div", {class: "muted small"}, `Источник: ${c.source || "—"} · ${Math.round(c.duration)} с`)),
       h("div", {class: "card"}, h("h2", {}, "Баннер", h("small", {}, `минимум ${cfg.min_area_percent}% экрана`)), bnBox),
       fillerCard(c),
+      stickerCard(c),
       h("div", {class: "card"}, h("h2", {}, "Пресеты", h("small", {}, "баннер, теги и подпись одним нажатием")),
         h("div", {class: "field"}, presetSel), presetInfo,
         h("div", {class: "sticky-actions"},
@@ -1038,6 +1065,16 @@ function pageFillers(page) {
   loadFillers().then(draw);
 }
 async function pagePresets(page) {
+  let tab = S.presetTab; if (!tab) { try { tab = localStorage.getItem("presetTab"); } catch (e) {} }
+  tab = tab === "stickers" ? "stickers" : "banners";
+  const body = h("div", {});
+  const seg = h("div", {class: "seg", style: {marginBottom: "16px"}}, [["banners", "Пресеты баннеров"], ["stickers", "Пресеты стикеров"]].map(([k, t]) =>
+    h("button", {class: tab === k ? "on" : "", onclick: () => { S.presetTab = k; try { localStorage.setItem("presetTab", k); } catch (e) {} render(); }}, t)));
+  page.append(seg, body);
+  if (tab === "stickers") return pageStickerPresets(body);
+  return pageBannerPresets(body);
+}
+async function pageBannerPresets(page) {
   try { S.presets = await api("GET", "/api/presets"); } catch (e) { S.presets = S.presets || []; }
   if (!S.banners.length) { try { await loadBanners(); } catch (e) {} }
   const box = h("div", {style: {display: "flex", flexDirection: "column", gap: "16px"}});
@@ -1141,33 +1178,35 @@ async function pageTemplates(page) {
         h("button", {class: "btn sm danger", onclick: () => confirmBox("Удалить шаблон?", `«${t.name}» будет удалён (группы и пресеты не изменятся).`, "Удалить", async () => {
           try { await api("DELETE", `/api/templates/${t.id}`); await loadTemplates(); draw(); } catch (e) { fail(e); } })}, "Удалить")),
         t.items.map(i => h("div", {class: "acc"}, h("div", {class: "grow"}, h("b", {}, i.group || "группа удалена"),
-          h("span", {class: "muted small"}, (i.preset_id ? `пресет баннеров: ${i.preset || "удалён"}` : "без пресета (баннер по умолчанию)") + (i.tags ? ` · теги группы: ${i.tags}` : ""))),
+          h("span", {class: "muted small"}, (i.preset_id ? `пресет баннеров: ${i.preset || "удалён"}` : "без пресета (баннер по умолчанию)") + (i.sticker_preset_id ? ` · стикеры: ${i.sticker_preset || "удалён"}` : "") + (i.tags ? ` · теги группы: ${i.tags}` : ""))),
           i.broken ? h("span", {class: "badge err"}, "исправь") : null))))
         : [h("div", {class: "card empty"}, h("b", {}, "Шаблонов пока нет"), "Создай шаблон, например «Собаки»: группы A и B, у каждой свой баннер.")]));
   };
   function edit(t) {
     const name = h("input", {type: "text", placeholder: "Например: «Собаки — все каналы»", value: t ? t.name : ""});
     const tags = h("input", {type: "text", placeholder: "#собаки #щенки — для клипов всех групп шаблона", value: t ? t.tags || "" : ""});
-    let rows = t ? t.items.map(i => ({group_id: i.group_id, preset_id: i.preset_id || "", tags: i.tags || ""})) : [{group_id: (S.groups[0] || {}).id, preset_id: "", tags: ""}];
+    let rows = t ? t.items.map(i => ({group_id: i.group_id, preset_id: i.preset_id || "", sticker_preset_id: i.sticker_preset_id || "", tags: i.tags || ""})) : [{group_id: (S.groups[0] || {}).id, preset_id: "", sticker_preset_id: "", tags: ""}];
     const list = h("div", {});
     const drawRows = () => {
       const used = new Set(rows.map(r => r.group_id));
       list.replaceChildren(...rows.map((r, idx) => {
         const gs = h("select", {style: {flex: "1", minWidth: "140px"}}, S.groups.filter(g => g.id === r.group_id || !used.has(g.id)).map(g => h("option", {value: g.id}, g.name)));
         gs.value = r.group_id; gs.onchange = () => { r.group_id = Number(gs.value); drawRows(); };
-        const ps = h("select", {style: {flex: "1", minWidth: "140px"}}, [h("option", {value: ""}, "— без пресета —"), ...(S.presets || []).map(p => h("option", {value: p.id}, p.name))]);
+        const ps = h("select", {style: {flex: "1", minWidth: "140px"}}, [h("option", {value: ""}, "— без пресета баннеров —"), ...(S.presets || []).map(p => h("option", {value: p.id}, p.name))]);
         ps.value = r.preset_id || ""; ps.onchange = () => { r.preset_id = Number(ps.value) || ""; };
+        const ss = h("select", {style: {flex: "1", minWidth: "140px"}}, [h("option", {value: ""}, "— без стикеров —"), ...(S.stickerPresets || []).map(p => h("option", {value: p.id}, p.name))]);
+        ss.value = r.sticker_preset_id || ""; ss.onchange = () => { r.sticker_preset_id = Number(ss.value) || ""; };
         const tg = h("input", {type: "text", placeholder: "теги этой группы", value: r.tags || "", style: {flex: "1", minWidth: "140px"}, oninput: () => { r.tags = tg.value; }});
-        return h("div", {class: "row", style: {marginBottom: "8px"}}, gs, ps, tg, h("button", {class: "btn sm danger", disabled: rows.length < 2, onclick: () => { rows.splice(idx, 1); drawRows(); }}, "×"));
-      }), h("button", {class: "btn sm", disabled: rows.length >= S.groups.length, onclick: () => { const free = S.groups.find(g => !used.has(g.id)); if (free) { rows.push({group_id: free.id, preset_id: "", tags: ""}); drawRows(); } }}, "+ Добавить группу"));
+        return h("div", {class: "row", style: {marginBottom: "8px"}}, gs, ps, ss, tg, h("button", {class: "btn sm danger", disabled: rows.length < 2, onclick: () => { rows.splice(idx, 1); drawRows(); }}, "×"));
+      }), h("button", {class: "btn sm", disabled: rows.length >= S.groups.length, onclick: () => { const free = S.groups.find(g => !used.has(g.id)); if (free) { rows.push({group_id: free.id, preset_id: "", sticker_preset_id: "", tags: ""}); drawRows(); } }}, "+ Добавить группу"));
     };
     drawRows();
     dialog(h("div", {}, h("h3", {}, t ? "Изменить шаблон" : "Новый шаблон"), h("div", {class: "muted small", style: {marginBottom: "6px"}}, "Название"), name,
       h("div", {class: "muted small", style: {margin: "12px 0 6px"}}, "Хэштеги для всех групп шаблона"), tags,
-      h("div", {class: "muted small", style: {margin: "12px 0 6px"}}, "Группа → пресет баннеров → свои хэштеги группы"), list),
+      h("div", {class: "muted small", style: {margin: "12px 0 6px"}}, "Группа → пресет баннеров → пресет стикеров → свои хэштеги группы"), list),
       [{text: "Отмена", cls: "ghost"}, {text: "Сохранить", cls: "primary", fn: async () => {
         try {
-          await api("POST", "/api/templates", {id: t ? t.id : undefined, name: name.value, tags: tags.value, items: rows.map(r => ({group_id: r.group_id, preset_id: r.preset_id || null, tags: r.tags || ""}))});
+          await api("POST", "/api/templates", {id: t ? t.id : undefined, name: name.value, tags: tags.value, items: rows.map(r => ({group_id: r.group_id, preset_id: r.preset_id || null, sticker_preset_id: r.sticker_preset_id || null, tags: r.tags || ""}))});
           await loadTemplates(); toast("Шаблон сохранён"); draw();
         } catch (e) { fail(e); } }}]);
     setTimeout(() => name.focus(), 50);
@@ -1298,6 +1337,68 @@ function applyTheme(t) {
   if (t) document.documentElement.setAttribute("data-theme", t); else document.documentElement.removeAttribute("data-theme");
 }
 
+
+/* ---------- пресеты стикеров ---------- */
+function pageStickerPresets(page) {
+  const box = h("div", {style: {display: "flex", flexDirection: "column", gap: "16px"}});
+  page.append(h("div", {class: "note", style: {marginBottom: "16px"}},
+    "Стикер — маленькая картинка без фона (насекомое), «приклеенная» поверх клипа. Положение задаётся в процентах высоты экрана: 100 % — самый верх, 50 % — середина. Размер — в миллиметрах на экране телефона: 4 мм ≈ живой муравей. Пресет хранит набор стикеров, их количество, диапазон высоты и размер; при применении к клипу программа случайно расставляет их в этом диапазоне."), box);
+  const imgUrl = n => "/api/stickers/file?name=" + encodeURIComponent(n);
+  const draw = () => {
+    const F = S.stickerLib || {dir: "", files: [], screen_mm: 67}, L = S.stickerPresets || [];
+    const lib = h("div", {class: "card"}, h("div", {class: "row", style: {marginBottom: "10px"}}, h("h2", {class: "grow", style: {margin: 0}}, "Библиотека стикеров", h("small", {}, `${F.files.length} шт.`)),
+      h("label", {class: "btn sm primary"}, "+ Загрузить PNG/WebP", h("input", {type: "file", hidden: true, multiple: true, accept: "image/png,image/webp", onchange: async e => {
+        const files = [...e.target.files]; e.target.value = ""; if (!files.length) return;
+        for (const f of files) { try { await api("PUT", "/api/stickers?name=" + encodeURIComponent(f.name), undefined, f); } catch (er) { fail(er); } }
+        await loadStickers(); draw(); toast("Загружено"); }}))),
+      h("div", {class: "muted small", style: {marginBottom: "10px"}}, `Папка: ${F.dir}. Поставляются нарисованные насекомые; свои PNG/WebP с прозрачным фоном можно загрузить сюда же.`),
+      h("div", {class: "stk-grid"}, F.files.map(f => h("div", {class: "stk-item"}, h("img", {src: imgUrl(f.name), alt: f.name}), h("div", {class: "muted small"}, f.name.replace(/\.\w+$/, "")),
+        h("button", {class: "btn sm danger", onclick: () => confirmBox("Удалить стикер?", `«${f.name}» будет удалён из папки (пресеты, где он выбран, перестанут его использовать).`, "Удалить", async () => {
+          try { await api("DELETE", "/api/stickers?name=" + encodeURIComponent(f.name)); await loadStickers(); draw(); } catch (er) { fail(er); } })}, "×")))));
+    box.replaceChildren(lib, h("div", {class: "row"}, h("button", {class: "btn primary", onclick: () => edit(null)}, "+ Новый пресет стикеров")),
+      ...(L.length ? L.map(p => h("div", {class: "card"}, h("div", {class: "row", style: {marginBottom: "6px"}}, h("h2", {style: {margin: 0}, class: "grow"}, p.name),
+        h("button", {class: "btn sm", onclick: () => edit(p)}, "Изменить"),
+        h("button", {class: "btn sm danger", onclick: () => confirmBox("Удалить пресет стикеров?", `«${p.name}» будет удалён (уже наложенные стикеры у клипов не изменятся, но шаблоны с ним нужно поправить).`, "Удалить", async () => {
+          try { await api("DELETE", `/api/sticker-presets/${p.id}`); await loadStickers(); draw(); } catch (er) { fail(er); } })}, "Удалить")),
+        h("div", {class: "muted small"}, `${p.files.length ? p.files.join(", ") : "случайные из всей библиотеки"} · штук: ${p.count} · высота ${p.y_min}–${p.y_max} % · размер ≈ ${p.size_mm} мм${p.rotate ? " · с поворотом" : ""}`)))
+        : [h("div", {class: "card empty"}, h("b", {}, "Пресетов стикеров пока нет"), "Создай первый: например «Муравьи» — 3 муравья на высоте 50–95 %.")]));
+  };
+  function edit(p) {
+    const D = (S.stickerLib && S.stickerLib.defaults) || {};
+    const st = p ? {...p, files: [...p.files]} : {id: null, name: "", files: [], count: D.count || 3, y_min: D.y_min ?? 50, y_max: D.y_max ?? 95, size_mm: D.size_mm || 4, rotate: true};
+    const name = h("input", {type: "text", placeholder: "Например: «Муравьи»", value: st.name});
+    const F = (S.stickerLib && S.stickerLib.files) || [];
+    const grid = h("div", {class: "stk-grid sel"});
+    const prev = h("div", {class: "stk-prev"});
+    const drawPrev = () => {
+      const pool = st.files.length ? st.files : F.map(f => f.name), w = 150, mm = (S.stickerLib && S.stickerLib.screen_mm) || 67;
+      const lo = Math.min(+st.y_min, +st.y_max), hi = Math.max(+st.y_min, +st.y_max);
+      prev.replaceChildren(h("div", {class: "stk-scale"}, "100 %"), h("div", {class: "stk-scale", style: {top: "50%"}}, "50 %"),
+        ...Array.from({length: Math.max(1, Math.min(12, +st.count || 1))}, () => pool.length ? h("img", {src: imgUrl(pool[Math.floor(Math.random() * pool.length)]), alt: "",
+          style: {position: "absolute", left: (8 + Math.random() * 84) + "%", top: (100 - (lo + Math.random() * (hi - lo))) + "%", width: ((+st.size_mm || 4) / mm * w) + "px",
+            transform: `translate(-50%,-50%) rotate(${st.rotate ? Math.round(Math.random() * 360) : 0}deg)`}}) : null));
+    };
+    const drawGrid = () => grid.replaceChildren(...F.map(f => { const on = st.files.includes(f.name);
+      return h("button", {class: "stk-item" + (on ? " on" : ""), type: "button", onclick: () => { st.files = on ? st.files.filter(x => x !== f.name) : [...st.files, f.name]; drawGrid(); drawPrev(); }},
+        h("img", {src: imgUrl(f.name), alt: f.name}), h("div", {class: "muted small"}, f.name.replace(/\.\w+$/, ""))); }));
+    const num = (key, label, step, min, max) => { const i = h("input", {type: "number", step: String(step), min: String(min), max: String(max), value: st[key], oninput: () => { st[key] = i.value === "" ? 0 : +i.value; drawPrev(); }});
+      return h("div", {class: "field"}, h("label", {}, label), i); };
+    const rot = h("input", {type: "checkbox", onchange: () => { st.rotate = rot.checked; drawPrev(); }}); rot.checked = !!st.rotate;
+    drawGrid(); drawPrev();
+    dialog(h("div", {}, h("h3", {}, p ? "Изменить пресет стикеров" : "Новый пресет стикеров"), h("div", {class: "muted small", style: {marginBottom: "6px"}}, "Название"), name,
+      h("div", {class: "muted small", style: {margin: "12px 0 6px"}}, "Какие стикеры (ничего не выбрано — случайные из всей библиотеки)"), grid,
+      h("div", {class: "stk-edit"}, h("div", {}, num("count", "Сколько штук (1–12)", 1, 1, 12), num("y_max", "Выше всего, % высоты (100 — верх экрана)", 1, 0, 100), num("y_min", "Ниже всего, % высоты", 1, 0, 100),
+        num("size_mm", "Размер, мм на экране телефона (4 ≈ муравей)", 0.5, 1, 40), h("label", {class: "check"}, rot, h("span", {}, "Случайный поворот"))),
+        h("div", {}, prev, h("div", {class: "muted small", style: {margin: "6px 0"}}, "Макет экрана телефона в натуральном масштабе: стикеры такие же мелкие, как будут на экране."), h("button", {class: "btn sm", type: "button", onclick: drawPrev}, "Расставить по-другому")))),
+      [{text: "Отмена", cls: "ghost"}, {text: "Сохранить", cls: "primary", fn: async () => {
+        try { await api("POST", "/api/sticker-presets", {id: st.id || undefined, name: name.value, files: st.files, count: +st.count, y_min: +st.y_min, y_max: +st.y_max, size_mm: +st.size_mm, rotate: st.rotate});
+          await loadStickers(); toast("Пресет стикеров сохранён"); draw(); } catch (e) { fail(e); } }}]);
+    setTimeout(() => name.focus(), 50);
+  }
+  draw();
+  loadStickers().then(draw);
+}
+
 /* ---------- TikTok: ручная выкладка ---------- */
 const TT_EXT_HINT = "Расширение не найдено. Установи его один раз: chrome://extensions → «Режим разработчика» → «Загрузить распакованное расширение» → папка browser-extension из проекта. Потом обнови эту страницу (F5).";
 function helperPing(timeout = 700) {
@@ -1379,9 +1480,12 @@ function pageTikTok(page) {
   const T = S.tt || (S.tt = {clips: [], accounts: []});
   const list = h("div", {class: "tt-grid"});
   const presetSel = h("select", {style: {minWidth: "240px"}});
+  const stickerSel = h("select", {style: {minWidth: "240px"}});
   const draw = () => {
-    presetSel.replaceChildren(h("option", {value: ""}, "— выбери пресет —"), ...(S.presets || []).map(p => h("option", {value: p.id}, p.name)));
+    presetSel.replaceChildren(h("option", {value: ""}, "— без пресета баннеров —"), ...(S.presets || []).map(p => h("option", {value: p.id}, p.name)));
+    stickerSel.replaceChildren(h("option", {value: ""}, "— без стикеров —"), ...(S.stickerPresets || []).map(p => h("option", {value: p.id}, p.name)));
     if (S.ttPreset) presetSel.value = S.ttPreset;
+    if (S.ttSticker) stickerSel.value = S.ttSticker;
     const used = [...new Set(T.clips.map(c => c.preset).filter(Boolean))];
     note.textContent = T.clips.length ? `Клипов: ${T.clips.length}. ` + (used.length ? `Сейчас применён пресет: ${used.join(", ")}.` : "Пресет не применён — у всех клипов только оригинал.") : "";
     list.replaceChildren(...T.clips.map(ttCard));
@@ -1390,21 +1494,23 @@ function pageTikTok(page) {
   };
   const note = h("span", {class: "muted small grow"});
   presetSel.onchange = () => { S.ttPreset = Number(presetSel.value) || null; };
+  stickerSel.onchange = () => { S.ttSticker = Number(stickerSel.value) || null; };
   const run = async (fn, okMsg) => { try { await fn(); } catch (e) { fail(e); } };
   const apply = h("button", {class: "btn primary", onclick: () => run(async () => {
-    if (!S.ttPreset) return toast("Выбери пресет", "err");
-    const t = await api("POST", "/api/tiktok/preset", {preset_id: S.ttPreset}); startTracking(t); toast("Применяю пресет ко всем клипам… (прошлый вариант с пресетом будет удалён)"); }) }, "Применить к клипам");
+    if (!S.ttPreset && !S.ttSticker) return toast("Выбери пресет баннеров и/или пресет стикеров", "err");
+    const t = await api("POST", "/api/tiktok/preset", {preset_id: S.ttPreset || undefined, sticker_preset_id: S.ttSticker || undefined}); startTracking(t); toast("Применяю пресет ко всем клипам… (прошлый вариант с пресетом будет удалён)"); }) }, "Применить к клипам");
   const reset = h("button", {class: "btn", title: "Убрать последний пресет: останутся только оригиналы", onclick: () => run(async () => {
     await api("POST", "/api/tiktok/reset"); await loadTikTok(); toast("Пресет убран, остались оригиналы"); render(); }) }, "Убрать пресет");
   const del = h("button", {class: "btn danger", onclick: () => confirmBox("Удалить все клипы вкладки?", "Будут удалены и оригиналы, и клипы с последним пресетом (и исходное видео, если оно больше не нужно). Это освободит место на диске, вернуть файлы нельзя.", "Удалить всё", () => run(async () => {
     const r = await api("DELETE", "/api/tiktok/clips"); await loadTikTok(); toast(`Удалено клипов: ${r.deleted}, освобождено ~${r.freed_mb} МБ`); render(); })) }, "Удалить все клипы и освободить место");
   const empty = h("div", {class: "card empty"}, h("b", {}, "Здесь пока пусто"), "На «Панели» вставь ссылку и отметь «Для ручной выкладки в TikTok» — нарезанные клипы без баннера появятся здесь.",
     h("div", {style: {marginTop: "14px"}}, h("button", {class: "btn primary", onclick: () => go("panel")}, "Перейти на «Панель»")));
-  page.append(h("div", {class: "card tt-block"}, h("h2", {}, "Пресет для всех клипов", h("small", {}, "оригинал + последний пресет, остальное удаляется")),
-      h("div", {class: "row", style: {gap: "10px", flexWrap: "wrap"}}, presetSel, apply, reset, note)),
+  page.append(h("div", {class: "card tt-block"}, h("h2", {}, "Пресеты для всех клипов", h("small", {}, "баннеры и/или стикеры; остаются оригинал + последний вариант")),
+      h("div", {class: "row", style: {gap: "10px", flexWrap: "wrap"}}, presetSel, stickerSel, apply, reset, note)),
     empty, list, h("div", {class: "row", style: {justifyContent: "flex-end"}}, del));
   draw();
   api("GET", "/api/presets").then(p => { S.presets = p; draw(); }).catch(() => {});
+  loadStickers().then(draw);
   loadTikTok().then(() => { if (S.page === "tiktok" && page.isConnected) { T.clips = S.tt.clips; draw(); } });
 }
 function ttCard(c) {
@@ -1453,7 +1559,7 @@ async function init() {
   addEventListener("hashchange", render);
   try {
     [S.cfg, S.health] = await Promise.all([api("GET", "/api/config"), api("GET", "/api/health")]);
-    await loadGroups(); await loadClips(); await loadTemplates(); await loadTikTok();
+    await loadGroups(); await loadClips(); await loadTemplates(); await loadTikTok(); await loadStickers();
   } catch (e) { fail(e); }
   renderHealth(); render(); pollTasks();
   setInterval(async () => { try { S.health = await api("GET", "/api/health"); renderHealth(); } catch (e) {} }, 15000);
