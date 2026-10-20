@@ -158,7 +158,7 @@ def run(url: str, cfg: dict, db: dbm.DB, group_id: int | None = None, log=print,
     else:
         if reddit:
             log("Режим «Реддит»: ищу истории и собираю клипы по 2–3 истории с комментариями.")
-            moments = find_reddit(segments, cfg, log)
+            moments = find_reddit(segments, cfg, log, video=video)
         else:
             moments = find_moments(segments, cfg, log)
         if not moments:
@@ -189,7 +189,7 @@ def run(url: str, cfg: dict, db: dbm.DB, group_id: int | None = None, log=print,
         if limit:
             re_ = min(re_, limit)
         tm.lap("поиск точек реза")
-        ass = make_ass(segments, rs, re_, sub_cfg, log, topic=title) if cfg["subtitles"]["enabled"] else None
+        ass = make_ass(segments, rs, re_, sub_cfg, log, topic=title) if cfg["subtitles"]["enabled"] and not reddit else None   # в «Реддите» свои субтитры уже в видео
         tm.lap("субтитры (LLM)")
         out = render_clip(video, rs, re_, out_dir / f"{i:0{width}d} {_slug(m.title)}.mp4", ass, render_cfg)
         filler_mod.write_sidecar(out, video, rs, re_, ass)     # нужно, чтобы позже собрать клип со вставкой прямо из исходника

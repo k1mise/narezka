@@ -693,3 +693,63 @@ def test_reddit_stories_uses_llm_boundaries(monkeypatch):
     assert [(s.start, s.end, s.title) for s in st] == [(20, 120, "А"), (120, 220, "Б"), (220, 299, "В")]
     clips = moments.find_reddit(segs, cfg, lambda *_: None)
     assert clips and all(60 * 0.7 <= c.end - c.start <= 180 for c in clips) and clips[0].start == 20
+
+
+def test_reddit_lenient_parsing_chunking_and_fallback(monkeypatch):
+    from narez import moments
+    assert moments._to_sec("[12:03]") == 723 and moments._to_sec("1:02:03") == 3723 and moments._to_sec("45,5") == 45.5 and moments._to_sec("abc") is None
+    assert moments._story_items({"stories": [{"time": "0:20", "name": "А"}, {"start": "[60.0]"}, 130]}) == [(20, "А"), (60, ""), (130, "")]
+    assert moments._story_items([10, 20]) == [(10, ""), (20, "")] and moments._story_items({"x": [{"start": 5}]}) == [(5, "")]
+    # куски ограничены и по секундам, и по символам (иначе не влезают в контекст модели)
+    segs = [_seg(i * 10, i * 10 + 9, "слово " * 30) for i in range(60)]
+    chunks = list(moments._reddit_chunks(segs, 8 * 60, 2000))
+    assert len(chunks) > 5 and all(sum(len(moments._line(x)) + 1 for x in ch) <= 2000 + 250 for ch in chunks)
+    assert [x for ch in chunks for x in ch] == segs
+    # модель ничего не нашла → запасной вариант режет подряд на части 60–180 с, а не падает
+    segs = [_seg(i * 10, i * 10 + 9, f"фраза {i}.") for i in range(60)]        # 600 с одной «истории»
+    monkeypatch.setattr(moments, "chat_json", lambda *a, **k: {"stories": []})
+    logs = []
+    clips = moments.find_reddit(segs, {"llm": {}, "reddit": {}}, logs.append)
+    assert len(clips) >= 4 and all(60 * 0.7 <= c.end - c.start <= 180 for c in clips) and any("режу подряд" in m for m in logs)
+    assert clips[0].start == 0 and all(clips[i].end <= clips[i + 1].start + 1 for i in range(len(clips) - 1))
+
+
+def test_visual_story_starts_from_series():
+    from narez import visual
+    s = [0.0] * 5 + [0.14] * 20 + [0.0] * 10 + [0.01] * 15 + [0.15] * 20 + [0.0] * 5 + [0.14] * 2 + [0.0] * 10 + [0.14] * 10
+    # карточки с 5 и 50; мигание на 2 с (индекс 75) игнорируется; последняя — с 87
+    assert visual.story_starts_from_series(s) == [5.0, 50.0, 87.0]
+    assert visual.story_starts_from_series([0.0] * 100) == []           # в углу ничего не появляется
+    assert visual.story_starts_from_series([0.14] * 30 + [0.0] * 10 + [0.14] * 20) == [0.0, 40.0]
+
+
+def test_stories_from_starts_and_find_reddit_uses_visual(monkeypatch):
+    from narez import moments, visual
+    segs = [_seg(i * 10, i * 10 + 9, f"фраза номер {i}.") for i in range(40)]      # 0..400 с
+    st = moments.stories_from_starts([3, 103, 203], segs)
+    assert [s.start for s in st] == [10, 110, 210]
+    st = moments.stories_from_starts([100, 200], segs)
+    assert [s.start for s in st] == [100, 200]
+    monkeypatch.setattr(visual, "story_starts", lambda v, log=print: [100.0, 200.0, 300.0])
+    monkeypatch.setattr(moments, "chat_json", lambda *a, **k: (_ for _ in ()).throw(AssertionError("LLM не нужен")))
+    clips = moments.find_reddit(segs, {"llm": {}, "reddit": {"stories_per_clip": 1}}, lambda *_: None, video="x.mp4")
+    assert [c.start for c in clips] == [100, 200, 300] and all(c.end - c.start >= 42 for c in clips)
+    # на картинке карточек нет → идём по тексту
+    monkeypatch.setattr(visual, "story_starts", lambda v, log=print: [])
+    monkeypatch.setattr(moments, "chat_json", lambda *a, **k: {"stories": [{"start": 0}, {"start": 150}]})
+    clips = moments.find_reddit(segs, {"llm": {}, "reddit": {}}, lambda *_: None, video="x.mp4")
+    assert clips and clips[0].start == 0
+
+
+def test_visual_story_starts_on_real_video(tmp_path):
+    import shutil
+    import subprocess
+    import pytest
+    if not shutil.which("ffmpeg"):
+        pytest.skip("нет ffmpeg")
+    from narez import visual
+    out = tmp_path / "v.mp4"
+    # 40 с: на светлом фоне карточка (тёмный блок слева вверху) в секундах 5–15 и 25–35
+    flt = "drawbox=x=20:y=10:w=500:h=110:color=black:t=fill:enable='between(t,5,15)+between(t,25,35)'"
+    subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", "color=c=white:s=640x360:r=10:d=40", "-vf", flt, "-pix_fmt", "yuv420p", str(out)], check=True)
+    assert [round(x) for x in visual.story_starts(out)] in ([5, 25], [6, 26])

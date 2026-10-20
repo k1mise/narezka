@@ -203,41 +203,85 @@ REDDIT = """Это транскрипт видео, где диктор озву
 Ответь ТОЛЬКО JSON: {{"stories":[{{"start":123.4,"title":"короткое название истории"}}]}} — таймкод начала каждой истории по порядку."""
 
 
+def _to_sec(v) -> float | None:
+    """Таймкод из ответа модели: 123.4, "123.4", "[123.4]", "12:03", "1:02:03"."""
+    if isinstance(v, (int, float)):
+        return float(v)
+    t = str(v).strip().strip("[]() с").replace(",", ".")
+    try:
+        if ":" in t:
+            parts = [float(x) for x in t.split(":")]
+            return sum(x * 60 ** i for i, x in enumerate(reversed(parts)))
+        return float(t)
+    except ValueError:
+        return None
+
+
+def _story_items(data) -> list[tuple[float, str]]:
+    items = data
+    if isinstance(data, dict):
+        items = next((data[k] for k in ("stories", "story", "starts", "items", "result") if k in data), None)
+        if items is None:
+            items = next((v for v in data.values() if isinstance(v, list)), [])
+    out = []
+    for it in items if isinstance(items, list) else []:
+        if isinstance(it, dict):
+            t = next((_to_sec(it[k]) for k in ("start", "time", "timestamp", "t", "begin") if k in it and _to_sec(it[k]) is not None), None)
+            title = str(it.get("title") or it.get("name") or "").strip()
+        else:
+            t, title = _to_sec(it), ""
+        if t is not None:
+            out.append((t, title))
+    return out
+
+
+def _reddit_chunks(segs: list[Segment], max_seconds: float, max_chars: int):
+    """Куски для модели: не длиннее max_seconds и не больше max_chars символов (иначе не влезут в контекст и модель отвечает пустотой)."""
+    cur, t0, size = [], None, 0
+    for sg in segs:
+        line = len(_line(sg)) + 1
+        if cur and (sg.end - t0 > max_seconds or size + line > max_chars):
+            yield cur
+            cur, t0, size = [], None, 0
+        if t0 is None:
+            t0 = sg.start
+        cur.append(sg); size += line
+    if cur:
+        yield cur
+
+
+def _line(sg: Segment) -> str:
+    txt = sg.text if len(sg.text) <= 200 else sg.text[:200] + "…"
+    return f"[{sg.start:.1f}] {txt}"
+
+
 def reddit_stories(segments: list[Segment], cfg: dict, log=print) -> list[Moment]:
     """Истории с комментариями как отдельные отрезки [начало истории; начало следующей). Вступление и концовка вне историй отбрасываются."""
     c = cfg["llm"]
-    chunk_s = float(c.get("reddit_chunk_minutes", 15)) * 60
+    max_s = float(c.get("reddit_chunk_minutes", 8)) * 60
+    max_chars = int(c.get("reddit_chunk_chars", 9000))
     segs = segments
     last_end = segs[-1].end if segs else 0.0
     starts: list[tuple[float, str]] = []
-    pos = 0
-    n = 0
+    pos, n = 0, 0
     while pos < len(segs):
-        t0 = segs[pos].start
-        chunk, j = [], pos
-        while j < len(segs) and (segs[j].end - t0 <= chunk_s or not chunk):
-            chunk.append(segs[j]); j += 1
+        chunk = next(_reddit_chunks(segs[pos:], max_s, max_chars))
+        j = pos + len(chunk)
         final = j >= len(segs)
         n += 1
         log(f"LLM ищет границы историй: часть {n}...")
-        data = chat_json(cfg, REDDIT, _format(chunk))
-        items = data.get("stories", []) if isinstance(data, dict) else data
-        found = []
-        for it in items if isinstance(items, list) else []:
-            try:
-                found.append((float(it["start"]), str(it.get("title", "")).strip()))
-            except (KeyError, TypeError, ValueError):
-                continue
-        found = sorted(f for f in found if t0 - 1 <= f[0] <= chunk[-1].end)
+        data = chat_json(cfg, REDDIT, "\n".join(_line(x) for x in chunk))
+        found = sorted(f for f in _story_items(data) if chunk[0].start - 1 <= f[0] <= chunk[-1].end)
+        if not found:
+            log(f"  модель не указала начала историй (ответ: {str(data)[:120]})")
         if not final and len(found) >= 2:     # последняя история куска могла оборваться — её разбираем в следующем куске целиком
             starts += found[:-1]
             pos = next(k for k, sg in enumerate(segs) if sg.start >= found[-1][0] - 1e-6)
         else:
             starts += found
             pos = j
-    # отрезок истории: от её начала до начала следующей; последняя — до конца речи
     snapped = []
-    for t, title in starts:
+    for t, title in sorted(starts):
         seg = min(segs, key=lambda x: abs(x.start - t))
         if not snapped or seg.start - snapped[-1][0] > 5:
             snapped.append((seg.start, title))
@@ -273,11 +317,60 @@ def group_stories(stories: list[Moment], lo: float, hi: float, per_clip: int = 3
     return clips
 
 
-def find_reddit(segments: list[Segment], cfg: dict, log=print) -> list[Moment]:
+def split_by_pauses(segments: list[Segment], lo: float, hi: float) -> list[Moment]:
+    """Запасной вариант: подряд идущие части по ~(lo+hi)/2 секунд, каждая заканчивается на конце фразы."""
+    target = (lo + hi) / 2
+    out, start = [], None
+    for k, sg in enumerate(segments):
+        if start is None:
+            start = sg.start
+        nxt = segments[k + 1] if k + 1 < len(segments) else None
+        dur = sg.end - start
+        if nxt is None or dur >= target or (nxt.end - start > hi):
+            if dur >= lo * 0.7:
+                out.append(Moment(start, sg.end, "", "", 6.0))
+                start = None
+            elif out and nxt is None:
+                out[-1] = Moment(out[-1].start, sg.end, "", "", 6.0)
+    return out
+
+
+def stories_from_starts(starts: list[float], segments: list[Segment]) -> list[Moment]:
+    """Истории по известным моментам начала: каждая начинается с первой фразы не раньше (начало − 0,5 с) и идёт до начала следующей."""
+    last_end = segments[-1].end if segments else 0.0
+    firsts: list[Segment] = []
+    for t in sorted(starts):
+        sg = next((x for x in segments if x.start >= t - 0.5), None)
+        if sg and (not firsts or sg.start - firsts[-1].start > 5):
+            firsts.append(sg)
+    out = []
+    for k, sg in enumerate(firsts):
+        end = firsts[k + 1].start if k + 1 < len(firsts) else last_end
+        out.append(Moment(sg.start, end, sg.text.strip()[:60], "", 7.0))
+    return out
+
+
+def find_reddit(segments: list[Segment], cfg: dict, log=print, video=None) -> list[Moment]:
     r = cfg.get("reddit", {})
     lo, hi = float(r.get("min_seconds", 60)), float(r.get("max_seconds", 180))
-    stories = reddit_stories(segments, cfg, log)
-    log(f"Найдено историй: {len(stories)}")
-    clips = group_stories(stories, lo, hi, int(r.get("stories_per_clip", 3)), int(r.get("min_stories", 2)))
+    stories: list[Moment] = []
+    if video is not None and r.get("visual", True):
+        from . import visual
+        log("Ищу начала историй по карточкам постов на экране...")
+        found = visual.story_starts(video, log)
+        if len(found) >= 2:
+            stories = stories_from_starts(found, segments)
+            log(f"По картинке найдено историй: {len(stories)}")
+        else:
+            log("Карточек постов на экране не нашёл — пробую найти истории по тексту.")
+    if len(stories) < 2:
+        stories = reddit_stories(segments, cfg, log)
+        log(f"Найдено историй: {len(stories)}")
+    if len(stories) < 2:
+        log(f"Границы историй не найдены (в видео одна история или модель их не нашла) — режу подряд на части по {lo:g}–{hi:g} с по концам фраз.")
+        clips = split_by_pauses(segments, lo, hi)
+    else:
+        clips = group_stories(stories, lo, hi, int(r.get("stories_per_clip", 3)), int(r.get("min_stories", 2)))
+        clips = [m for m in clips if m.end - m.start >= lo * 0.7]     # короткий хвост (прощание, «ссылки») — не история
     clips = [x for x in (snap(m, segments, lo * 0.7, hi) for m in clips) if x]
     return clips[: int(r.get("max_clips", 20))]
