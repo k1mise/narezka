@@ -1180,3 +1180,148 @@ def test_cut_params_reddit_and_trim(env, monkeypatch):
     assert got[-1]["reddit"] is True and got[-1]["trim_end"] == 0
     wait_task(c, c.post("/api/process", json={**base, "reddit": True, "mode": "full"}).json())
     assert got[-1]["reddit"] is False        # «Реддит» только для режима «интересные моменты»
+
+
+# ---------- стикеры ----------
+def _sticker_env(cfg, tmp_path):
+    d = tmp_path / "stk"
+    d.mkdir()
+    for n, col in (("a.png", "red"), ("b.png", "blue")):
+        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i", f"color=c={col}:s=64x64:d=1", "-frames:v", "1", str(d / n)], check=True)
+    cfg["stickers"] = {"dir": str(d)}
+    return d
+
+
+def test_sticker_library_and_presets_crud(env, tmp_path):
+    c, cfg, db, _ = env
+    d = _sticker_env(cfg, tmp_path)
+    lib = c.get("/api/stickers").json()
+    assert [f["name"] for f in lib["files"]] == ["a.png", "b.png"] and lib["screen_mm"] == 67.0
+    assert c.get("/api/stickers/file", params={"name": "a.png"}).status_code == 200
+    assert c.get("/api/stickers/file", params={"name": "../x.png"}).status_code == 404
+    assert c.put("/api/stickers", params={"name": "x.txt"}, content=b"zz").status_code == 400
+    assert c.put("/api/stickers", params={"name": "bad.png"}, content=b"not an image").status_code == 400
+    assert not (d / "bad.png").exists()
+    r = c.post("/api/sticker-presets", json={"name": " "})
+    assert r.status_code == 400
+    assert c.post("/api/sticker-presets", json={"name": "x", "files": ["нет.png"]}).status_code == 400
+    p = c.post("/api/sticker-presets", json={"name": "Муравьи", "files": ["a.png"], "count": 2, "y_min": 95, "y_max": 50, "size_mm": 4}).json()
+    assert p["y_min"] == 50 and p["y_max"] == 95 and p["count"] == 2 and p["files"] == ["a.png"]       # границы переставлены
+    p2 = c.post("/api/sticker-presets", json={"id": p["id"], "name": "Муравьи 2", "count": 99, "size_mm": 900}).json()
+    assert p2["name"] == "Муравьи 2" and p2["count"] == 12 and p2["size_mm"] == 40 and p2["files"] == []
+    assert [x["name"] for x in c.get("/api/sticker-presets").json()] == ["Муравьи 2"]
+    assert c.delete(f"/api/sticker-presets/{p['id']}").status_code == 200
+    assert c.delete("/api/stickers", params={"name": "b.png"}).status_code == 200 and not (d / "b.png").exists()
+
+
+@pytest.mark.skipif(not shutil.which("ffmpeg"), reason="нужен ffmpeg")
+def test_stickers_apply_render_position_and_size(env, tmp_path):
+    c, cfg, db, _ = env
+    from narez import banner as bn, stickers as stk
+    _sticker_env(cfg, tmp_path)
+    cfg["clips"].update(preset="ultrafast")
+    g = db.add_group("g")
+    j = db.add_job(g, "u", "s")
+    base = cfg["paths"]["workdir"] / "clips" / "st.mp4"
+    base.parent.mkdir(exist_ok=True)
+    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i", "color=c=white:s=540x960:d=1:r=10", "-pix_fmt", "yuv420p", str(base)], check=True)
+    cid = db.add_clip(j, str(base), Moment(0, 1, "t", "d", 5))
+    p = c.post("/api/sticker-presets", json={"name": "P", "files": ["a.png"], "count": 1, "y_min": 70, "y_max": 70, "size_mm": 6.7, "rotate": False}).json()
+    r = c.post(f"/api/sticker-presets/{p['id']}/apply", json={"clip_ids": [cid]}).json()
+    st = r[0]["stickers"]
+    assert st["preset"] == "P" and len(st["items"]) == 1 and st["items"][0]["y"] == 70 and st["items"][0]["file"] == "a.png"
+    assert stk.size_px(6.7, 540) == 54 and stk.size_px(4, 1080) == 64            # 4 мм ≈ 64 px на кадре 1080 (живой муравей)
+    out = bn.ensure_final(db, db.clip(cid), cfg)
+    assert out.name.endswith(".st.mp4") and out.exists()
+    # цвет стикера найден там, где задано: y = 70 % высоты от НИЗА → 30 % от верха кадра
+    it = st["items"][0]
+    cx, cy = int(it["x"] * 540), int(0.30 * 960)
+    raw = subprocess.run(["ffmpeg", "-v", "error", "-i", str(out), "-vf", f"crop=2:2:{cx - 1}:{cy - 1},format=rgb24", "-frames:v", "1", "-f", "rawvideo", "-"],
+                         capture_output=True, check=True).stdout
+    assert raw[0] > 180 and raw[1] < 90 and raw[2] < 90                              # красный стикер в центре
+    raw = subprocess.run(["ffmpeg", "-v", "error", "-i", str(out), "-vf", "crop=2:2:2:2,format=rgb24", "-frames:v", "1", "-f", "rawvideo", "-"],
+                         capture_output=True, check=True).stdout
+    assert min(raw[:3]) > 200                                                        # остальной кадр белый
+    assert bn.cached_final(db.clip(cid), cfg) == out
+    assert bn.ensure_final(db, db.clip(cid), cfg) == out                             # кэш: повторно не пересобирается
+    # убрать стикеры
+    assert c.patch(f"/api/clips/{cid}", json={"stickers": {}}).json()["stickers"] is None
+    assert bn.cached_final(db.clip(cid), cfg) is None
+
+
+def test_template_with_sticker_preset_and_tiktok_stickers(env, tmp_path):
+    c, cfg, db, _ = env
+    _sticker_env(cfg, tmp_path)
+    cfg["clips"].update(preset="ultrafast")
+    g1, g2 = db.add_group("g1"), db.add_group("g2")
+    sp = c.post("/api/sticker-presets", json={"name": "Жуки", "count": 2}).json()
+    assert c.post("/api/templates", json={"name": "T", "items": [{"group_id": g1, "sticker_preset_id": 999}]}).status_code == 400
+    t = c.post("/api/templates", json={"name": "T", "items": [{"group_id": g1, "sticker_preset_id": sp["id"]}, {"group_id": g2}]}).json()
+    assert t["items"][0]["sticker_preset"] == "Жуки" and t["items"][1]["sticker_preset_id"] is None and not t["broken"]
+    # fan_out: клипы первой группы получают стикеры, второй — нет
+    j = db.add_job(None, "u", "s")
+    path = cfg["paths"]["workdir"] / "clips" / "f.mp4"; _mk_video(path)
+    cid = db.add_clip(j, str(path), Moment(0, 1, "t", "d", 5))
+    from narez.web import server  # noqa: F401
+    gid, plan = None, None
+    # TikTok-вкладка: только стикеры, без баннера
+    db.update_clip(cid, status="tiktok")
+    r = wait_task(c, c.post("/api/tiktok/preset", json={"sticker_preset_id": sp["id"]}).json(), 60)
+    assert r["status"] == "done", r
+    x = c.get("/api/tiktok/clips").json()[0]
+    assert x["preset"] == "Жуки" and x["has_preset_file"] and x["stickers"] and len(x["stickers"]["items"]) == 2
+    assert Path(x["path_preset"]).name.endswith(".st.mp4") and Path(x["path_preset"]).exists()
+    assert c.post("/api/tiktok/preset", json={}).status_code == 400
+    c.post("/api/tiktok/reset")
+    y = c.get("/api/tiktok/clips").json()[0]
+    assert y["stickers"] is None and not y["has_preset_file"] and not Path(x["path_preset"]).exists()
+
+
+def test_tiktok_selection_log_and_clipboard(env):
+    c, cfg, db, _ = env
+    c1, c2, c3 = _tt_clip(db, cfg, 1), _tt_clip(db, cfg, 2), _tt_clip(db, cfg, 3)
+    bdir = cfg["paths"]["workdir"] / "banners"
+    bdir.mkdir(exist_ok=True)
+    _png(bdir / "a.png")
+    pa = c.post("/api/presets", json={"name": "A", "banner": {"name": "a.png", "start": 0, "duration": 1}, "tags": "", "footer": ""}).json()
+    # пресет только к выбранным
+    assert c.post("/api/tiktok/preset", json={"preset_id": pa["id"], "clip_ids": []}).status_code == 400
+    t = wait_task(c, c.post("/api/tiktok/preset", json={"preset_id": pa["id"], "clip_ids": [c1, c3]}).json(), 60)
+    assert t["status"] == "done", t
+    items = {x["id"]: x for x in c.get("/api/tiktok/clips").json()}
+    assert items[c1]["has_preset_file"] and items[c3]["has_preset_file"] and not items[c2]["has_preset_file"] and items[c2]["preset"] == ""
+    lines = c.get("/api/tiktok/log").json()["lines"]
+    assert any("Применяю «A»" in x for x in lines) and any(f"#{c1}" in x and "готово" in x for x in lines)
+    # сброс и удаление только выбранных
+    assert c.post("/api/tiktok/reset", json={"clip_ids": [c1]}).json()["clips"] == 1
+    items = {x["id"]: x for x in c.get("/api/tiktok/clips").json()}
+    assert not items[c1]["has_preset_file"] and items[c3]["has_preset_file"]
+    assert c.delete(f"/api/tiktok/clips?ids={c1},{c2}").json()["deleted"] == 2
+    assert [x["id"] for x in c.get("/api/tiktok/clips").json()] == [c3]
+    assert c.delete(f"/api/clips/{c3}").status_code == 200           # одиночное удаление тоже в журнале
+    lines = c.get("/api/tiktok/log").json()["lines"]
+    assert any(f"Клип #{c1} удалён" in x for x in lines) and any(f"Клип #{c3} удалён" in x for x in lines)
+    assert c.delete("/api/tiktok/log").status_code == 200 and c.get("/api/tiktok/log").json()["lines"] == []
+    import sys
+    if not sys.platform.startswith("win"):
+        assert c.post("/api/clipboard", json={"items": ["a"]}).status_code == 501
+
+
+def test_tiktok_clip_lengths_and_preset_speed(env):
+    c, cfg, db, _ = env
+    from narez import banner as bn
+    c1 = _tt_clip(db, cfg, 1)
+    x = c.get("/api/tiktok/clips").json()[0]
+    assert x["length_original"] and abs(x["length_original"] - bn.probe(x["path_original"])["duration"]) < 0.2 and x["length_preset"] is None
+    bdir = cfg["paths"]["workdir"] / "banners"
+    bdir.mkdir(exist_ok=True)
+    _png(bdir / "a.png")
+    pa = c.post("/api/presets", json={"name": "A", "banner": {"name": "a.png", "start": 0, "duration": 1}}).json()
+    assert wait_task(c, c.post("/api/tiktok/preset", json={"preset_id": pa["id"], "clip_ids": [c1]}).json(), 60)["status"] == "done"
+    x = c.get("/api/tiktok/clips").json()[0]
+    assert x["length_preset"] and abs(x["length_preset"] - x["length_original"]) < 0.3
+    # скорость сохраняется в пресете: по умолчанию 1, больше 2 обрезается
+    p = c.post("/api/presets", json={"name": "S", "banners": [{"name": "a.png", "speed": 9}]}).json()
+    assert p["banners"][0]["speed"] == 2.0
+    p = c.post("/api/presets", json={"name": "S2", "banners": [{"name": "a.png"}]}).json()
+    assert p["banners"][0]["speed"] == 1.0

@@ -19,6 +19,7 @@ from pydantic import BaseModel
 
 from .. import banner as bn
 from .. import filler as filler_mod
+from .. import stickers as stk
 from .. import schedule, service
 from ..cleanup import discard_clip, sweep_sources
 from ..config import FOLDER_TITLES, folder, load_config
@@ -124,8 +125,30 @@ class TikTokAccountIn(BaseModel):
     note: str = ""
 
 
+class StickerPresetIn(BaseModel):
+    id: Optional[int] = None
+    name: str
+    files: list[str] = []          # пусто — случайные из всей папки
+    count: int = 3
+    y_min: float = 50
+    y_max: float = 95
+    size_mm: float = 4
+    rotate: bool = True
+
+
 class TikTokPresetIn(BaseModel):
-    preset_id: int
+    preset_id: Optional[int] = None            # пресет баннеров
+    sticker_preset_id: Optional[int] = None    # пресет стикеров
+    clip_ids: Optional[list[int]] = None       # к каким клипам применить (None — ко всем)
+
+
+class TikTokIdsIn(BaseModel):
+    clip_ids: Optional[list[int]] = None
+
+
+class ClipboardIn(BaseModel):
+    items: list[str]
+    delay: float = 1.5
 
 
 class ApplyIn(BaseModel):
@@ -149,6 +172,7 @@ class FileIn(CutIn):
 class TemplateItemIn(BaseModel):
     group_id: int
     preset_id: Optional[int] = None
+    sticker_preset_id: Optional[int] = None
     tags: str = ""                 # хэштеги только для этой группы
 
 
@@ -165,6 +189,7 @@ class ClipPatch(BaseModel):
     tags: Optional[str] = None
     banner: Optional[dict] = None
     banners: Optional[list[dict]] = None
+    stickers: Optional[dict] = None           # пусто/{} — убрать стикеры (задать раскладку можно только пресетом)
     filler: Optional[dict] = None             # {"position": "top"|"bottom"|"" (без вставки), "file": "" (случайное) | имя файла}
     publish_at: Optional[str] = None
     group_id: Optional[int] = None
@@ -265,6 +290,7 @@ def create_app(cfg: dict | None = None) -> FastAPI:
                 "tags": c["tags"] or "", "duration": round((c["end"] or 0) - (c["start"] or 0), 1),
                 "score": round(c["score"], 1) if c["score"] else None,
                 "filler": filler_mod.normalize(c["filler"]),
+                "stickers": stk.normalize(c["stickers"]),
                 "banners": banners_json(c["banner"]),
                 "banner": (banners_json(c["banner"]) or [None])[0], "publish_at": c["publish_at"] or "",
                 "has_file": bool(c["path"]) and Path(c["path"]).exists(),
@@ -534,6 +560,8 @@ def create_app(cfg: dict | None = None) -> FastAPI:
             upd["banner"] = bn.specs_to_json(clean_specs(raw))
         if "filler" in sent:
             upd["filler"] = filler_json(body.filler)
+        if "stickers" in sent and not body.stickers:
+            upd.update(stickers="", sticker_path="", sticker_applied="")
         if "group_id" in sent and body.group_id is not None:
             need_group(d, body.group_id)
             upd["group_id"] = body.group_id
@@ -553,8 +581,11 @@ def create_app(cfg: dict | None = None) -> FastAPI:
 
     @app.delete("/api/clips/{clip_id}")
     def delete_clip(clip_id: int, d: DB = Depends(get_db)):
-        need_clip(d, clip_id)
+        c0 = need_clip(d, clip_id)
+        was_tt = c0["status"] == "tiktok"
         discard_clip(d, cfg, clip_id)
+        if was_tt:
+            ttlog(f"Клип #{clip_id} удалён: {c0['title'] or ''}".rstrip(": "))
         return {"ok": True}
 
     @app.get("/api/clips/{clip_id}/video")
@@ -741,14 +772,118 @@ def create_app(cfg: dict | None = None) -> FastAPI:
             raise HTTPException(400, str(e)) from None
         return [clip_json(d.clip(cid), d) for cid in apply_preset_to(d, pr, spec, body.clip_ids)]
 
+    # ---------- стикеры: библиотека и пресеты ----------
+    def sticker_json(r) -> dict:
+        data = stk.clean_preset(json.loads(r["data"] or "{}"), cfg)
+        return {"id": r["id"], "name": r["name"], **data}
+
+    def apply_stickers_to(d: DB, sp: dict, clip_ids: list[int]) -> list[int]:
+        """Раскладка стикеров пресета записывается в клип (у каждого клипа своя случайная); баннеры и вставка не меняются."""
+        done = []
+        for cid in clip_ids:
+            c = d.clip(cid)
+            if not c or c["status"] not in ("ready", "tiktok"):
+                continue
+            lay = stk.layout(sp, cfg, f"{cid}:{sp['id']}:{time.time_ns()}")
+            lay["preset"] = sp["name"]
+            d.update_clip(cid, stickers=stk.to_json(lay), sticker_path="", sticker_applied="")
+            done.append(cid)
+        return done
+
+    @app.get("/api/stickers")
+    def stickers_list():
+        d = stk.library_dir(cfg)
+        return {"dir": str(d), "screen_mm": stk.SCREEN_MM, "defaults": {k: v for k, v in stk.scfg(cfg).items() if k != "dir"},
+                "files": [{"name": p.name, "size": p.stat().st_size} for p in stk.library(cfg)]}
+
+    @app.get("/api/stickers/file")
+    def stickers_file(name: str):
+        p = stk.library_dir(cfg) / Path(name).name
+        if not p.is_file() or p.suffix.lower() not in stk.IMG_EXT:
+            raise HTTPException(404, "Файл не найден")
+        return FileResponse(p, headers={"Cache-Control": "no-cache"})
+
+    @app.put("/api/stickers")
+    async def stickers_upload(request: Request, name: str):
+        base = re.sub(r"[^\w.\- ]", "_", Path(name).name).strip()
+        if Path(base).suffix.lower() not in stk.IMG_EXT:
+            raise HTTPException(400, "Допустимы картинки PNG или WebP (лучше с прозрачным фоном)")
+        folder = stk.library_dir(cfg)
+        folder.mkdir(parents=True, exist_ok=True)
+        data = bytearray()
+        async for chunk in request.stream():
+            data += chunk
+            if len(data) > 8 * 1024 * 1024:
+                raise HTTPException(413, "Файл больше 8 МБ")
+        if not data:
+            raise HTTPException(400, "Пустой файл")
+        dest = folder / base
+        dest.write_bytes(bytes(data))
+        try:
+            info = bn.probe(dest)
+        except Exception as e:  # noqa: BLE001
+            dest.unlink(missing_ok=True)
+            raise HTTPException(400, f"Файл не распознан как картинка: {e}") from None
+        return {"name": dest.name, "width": info.get("w"), "height": info.get("h")}
+
+    @app.delete("/api/stickers")
+    def stickers_delete(name: str):
+        p = stk.library_dir(cfg) / Path(name).name
+        if not p.is_file() or p.suffix.lower() not in stk.IMG_EXT:
+            raise HTTPException(404, "Файл не найден")
+        p.unlink()
+        return {"ok": True}
+
+    @app.get("/api/sticker-presets")
+    def sticker_presets(d: DB = Depends(get_db)):
+        return [sticker_json(r) for r in d.sticker_presets()]
+
+    @app.post("/api/sticker-presets")
+    def sticker_preset_save(body: StickerPresetIn, d: DB = Depends(get_db)):
+        name = body.name.strip()
+        if not name:
+            raise HTTPException(400, "Дай пресету название")
+        lib = {p.name for p in stk.library(cfg)}
+        bad = [f for f in body.files if Path(f).name not in lib]
+        if bad:
+            raise HTTPException(400, f"Нет такого стикера в папке: {bad[0]}")
+        data = stk.clean_preset(body.model_dump(), cfg)
+        if body.id and not d.sticker_preset(body.id):
+            raise HTTPException(404, "Пресет не найден")
+        if any(r["id"] != body.id and r["name"].lower() == name.lower() for r in d.sticker_presets()):
+            if body.id:
+                raise HTTPException(400, f"Пресет «{name}» уже есть")
+            body.id = next(r["id"] for r in d.sticker_presets() if r["name"].lower() == name.lower())    # создание с тем же именем = перезапись
+        return sticker_json(d.sticker_preset(d.save_sticker_preset(name, data, body.id)))
+
+    @app.delete("/api/sticker-presets/{preset_id}")
+    def sticker_preset_del(preset_id: int, d: DB = Depends(get_db)):
+        if not d.sticker_preset(preset_id):
+            raise HTTPException(404, "Пресет не найден")
+        d.delete_sticker_preset(preset_id)
+        return {"ok": True}
+
+    @app.post("/api/sticker-presets/{preset_id}/apply")
+    def sticker_preset_apply(preset_id: int, body: ApplyIn, d: DB = Depends(get_db)):
+        r = d.sticker_preset(preset_id)
+        if not r:
+            raise HTTPException(404, "Пресет не найден")
+        try:
+            ids = apply_stickers_to(d, sticker_json(r), body.clip_ids)
+        except stk.StickerError as e:
+            raise HTTPException(400, str(e)) from None
+        return [clip_json(d.clip(cid), d) for cid in ids]
+
     # ---------- шаблоны публикации ----------
     def template_json(r, d: DB) -> dict:
         items = []
         for it in json.loads(r["data"] or "{}").get("items", []):
             g = d.group(it["group_id"])
             pr = d.preset(it["preset_id"]) if it.get("preset_id") else None
+            sp = d.sticker_preset(it["sticker_preset_id"]) if it.get("sticker_preset_id") else None
             items.append({"group_id": it["group_id"], "group": g["name"] if g else "", "preset_id": it.get("preset_id"), "tags": it.get("tags", ""),
-                          "preset": pr["name"] if pr else "", "broken": not g or (bool(it.get("preset_id")) and not pr)})
+                          "preset": pr["name"] if pr else "", "sticker_preset_id": it.get("sticker_preset_id"), "sticker_preset": sp["name"] if sp else "",
+                          "broken": not g or (bool(it.get("preset_id")) and not pr) or (bool(it.get("sticker_preset_id")) and not sp)})
         return {"id": r["id"], "name": r["name"], "tags": json.loads(r["data"] or "{}").get("tags", ""), "items": items,
                 "broken": any(i["broken"] for i in items)}
 
@@ -771,13 +906,16 @@ def create_app(cfg: dict | None = None) -> FastAPI:
             seen.add(it.group_id)
             if it.preset_id and not d.preset(it.preset_id):
                 raise HTTPException(400, "Пресет баннеров не найден — выбери другой")
+            if it.sticker_preset_id and not d.sticker_preset(it.sticker_preset_id):
+                raise HTTPException(400, "Пресет стикеров не найден — выбери другой")
         if body.id and not d.template(body.id):
             raise HTTPException(404, "Шаблон не найден")
         other = next((t for t in d.templates() if t["name"].lower() == name.lower() and t["id"] != body.id), None)
         if other:
             raise HTTPException(400, f"Шаблон «{name}» уже есть")
         tid = d.save_template(name, {"tags": normalize_tags(body.tags),
-                                     "items": [{"group_id": i.group_id, "preset_id": i.preset_id or None, "tags": normalize_tags(i.tags)} for i in body.items]}, body.id)
+                                     "items": [{"group_id": i.group_id, "preset_id": i.preset_id or None, "sticker_preset_id": i.sticker_preset_id or None,
+                                                  "tags": normalize_tags(i.tags)} for i in body.items]}, body.id)
         return template_json(d.template(tid), d)
 
     @app.delete("/api/templates/{tpl_id}")
@@ -810,7 +948,13 @@ def create_app(cfg: dict | None = None) -> FastAPI:
                     preset_banner_spec(pr)
                 except ValueError as e:
                     raise HTTPException(400, str(e)) from None
-            plan.append((it["group_id"], pr, normalize_tags((tdata.get("tags", "") + " " + it.get("tags", "")).strip())))
+            sp = None
+            if it.get("sticker_preset_id"):
+                spr = d.sticker_preset(it["sticker_preset_id"])
+                if not spr:
+                    raise HTTPException(400, "В шаблоне есть удалённый пресет стикеров — отредактируй шаблон")
+                sp = sticker_json(spr)
+            plan.append((it["group_id"], pr, normalize_tags((tdata.get("tags", "") + " " + it.get("tags", "")).strip()), sp))
         if not plan:
             raise HTTPException(400, "Шаблон пуст")
         return plan[0][0], plan
@@ -821,7 +965,7 @@ def create_app(cfg: dict | None = None) -> FastAPI:
             return
         base = [c["id"] for c in d.clips(job_id)]
         by_group = {plan[0][0]: list(base)}
-        for gid, _, _t in plan[1:]:
+        for gid, *_ in plan[1:]:
             ids = []
             for cid in base:
                 c = d.clip(cid)
@@ -836,20 +980,85 @@ def create_app(cfg: dict | None = None) -> FastAPI:
                     tdst = str(t2)
                 ids.append(d.copy_clip(cid, str(dst), tdst, gid))
             by_group[gid] = ids
-        for gid, pr, extra in plan:
+        for gid, pr, extra, sp in plan:
             ids = by_group[gid]
             for cid in ids:
                 d.update_clip(cid, group_id=gid)
             g = d.group(gid)
             if pr:
                 apply_preset_to(d, pr, preset_banner_spec(pr), ids)
+            if sp:
+                apply_stickers_to(d, sp, ids)
             if extra:  # хэштеги шаблона ставим первыми: при лимите в 15 тегов обрезаются остальные, а не они
                 for cid in ids:
                     d.update_clip(cid, tags=normalize_tags(extra + " " + (d.clip(cid)["tags"] or "")))
-            log(f"Группа «{g['name']}»: {len(ids)} клип(ов)" + (f", пресет «{pr['name']}»" if pr else "") + (f", теги {extra}" if extra else ""))
+            log(f"Группа «{g['name']}»: {len(ids)} клип(ов)" + (f", пресет «{pr['name']}»" if pr else "") + (f", теги {extra}" if extra else "") + (f", стикеры «{sp['name']}»" if sp else ""))
 
     # ---------- TikTok: ручная выкладка ----------
+    tt_log_lines: list = []     # журнал вкладки TikTok: наложение пресетов, сброс, удаление, ошибки
+    tt_log_lock = threading.Lock()
+
+    def ttlog(msg: str):
+        line = f"{time.strftime('%H:%M:%S')}  {msg}"
+        with tt_log_lock:
+            tt_log_lines.append(line)
+            del tt_log_lines[:-500]
+        try:
+            lp = Path(cfg["paths"]["workdir"]) / "logs"
+            lp.mkdir(parents=True, exist_ok=True)
+            with open(lp / "tiktok.log", "a", encoding="utf-8") as f:
+                f.write(f"{time.strftime('%Y-%m-%d')} {line}\n")
+        except OSError:
+            pass
+
+    @app.get("/api/tiktok/log")
+    def tt_log():
+        with tt_log_lock:
+            return {"lines": list(tt_log_lines)}
+
+    @app.delete("/api/tiktok/log")
+    def tt_log_clear():
+        with tt_log_lock:
+            tt_log_lines.clear()
+        return {"ok": True}
+
+    @app.post("/api/clipboard")
+    def clipboard_seq(body: ClipboardIn):
+        """Кладёт в буфер обмена Windows по очереди несколько текстов с паузой (чтобы в истории Win+V остался каждый).
+        Делается из программы, а не из браузера: так надёжнее. Вне Windows — 501, и страница копирует сама."""
+        import base64
+        import subprocess
+        import sys
+        if not sys.platform.startswith("win"):
+            raise HTTPException(501, "Только Windows")
+        items = [x for x in body.items if x is not None][:10]
+        for i, t in enumerate(items):
+            b64 = base64.b64encode(t.encode("utf-8")).decode()
+            ps = f"Set-Clipboard -Value ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{b64}')))"
+            r = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps], capture_output=True, timeout=20)
+            if r.returncode != 0:
+                raise HTTPException(500, "Не удалось записать в буфер: " + r.stderr.decode("utf-8", "replace")[:200])
+            if i < len(items) - 1:
+                time.sleep(max(0.3, min(body.delay, 5.0)))
+        return {"ok": True, "n": len(items)}
+
     tt_armed: dict = {}      # account_id -> время, до которого расширение может забрать данные для входа (один раз)
+
+    len_cache: dict = {}
+
+    def file_len(path) -> float | None:
+        """Реальная длина файла клипа в секундах (с учётом паузы баннера); кэш по пути и времени изменения."""
+        try:
+            p = Path(path)
+            key = (str(p), p.stat().st_mtime_ns)
+        except (OSError, TypeError):
+            return None
+        if key not in len_cache:
+            try:
+                len_cache[key] = round(bn.probe(p)["duration"], 1)
+            except Exception:  # noqa: BLE001
+                len_cache[key] = None
+        return len_cache[key]
 
     def tt_clip_json(c, d: DB) -> dict:
         j = clip_json(c, d)
@@ -859,6 +1068,7 @@ def create_app(cfg: dict | None = None) -> FastAPI:
             pre = {}
         fin = bn.cached_final(c, cfg)
         orig = str(Path(c["path"]).resolve()) if c["path"] else ""
+        j.update(length_original=file_len(orig), length_preset=file_len(fin) if fin else None)
         j.update(preset=pre.get("name", ""), preset_id=pre.get("id"), has_preset_file=bool(fin),
                  path_original=orig, path_preset=str(Path(fin).resolve()) if fin else "",
                  text=(j["description"] + ("\n\n" + j["tags"] if j["tags"] else "")).strip())
@@ -880,70 +1090,114 @@ def create_app(cfg: dict | None = None) -> FastAPI:
         if old.get("tags"):
             drop = {t.lower() for t in old["tags"].split()}
             upd["tags"] = " ".join(t for t in (c["tags"] or "").split() if t.lower() not in drop)
-        fin = c["final_path"]
-        if fin and fin != c["path"]:
-            try:
-                if Path(fin).is_file() and Path(fin).resolve().is_relative_to(wd.resolve()):
-                    Path(fin).unlink()
-            except OSError:
-                pass
-        upd.update(banner="", final_path="", banner_applied="", tt_preset="")
+        for fin in (c["final_path"], c["sticker_path"]):
+            if fin and fin != c["path"]:
+                try:
+                    if Path(fin).is_file() and Path(fin).resolve().is_relative_to(wd.resolve()):
+                        Path(fin).unlink()
+                except OSError:
+                    pass
+        upd.update(banner="", final_path="", banner_applied="", tt_preset="", stickers="", sticker_path="", sticker_applied="")
         return upd
 
     @app.post("/api/tiktok/preset")
     def tt_apply_preset(body: TikTokPresetIn, d: DB = Depends(get_db)):
-        """Пресет применяется ко всем клипам вкладки; прежний пресет и его файлы удаляются (остаются оригинал и последний пресет)."""
-        r = d.preset(body.preset_id)
-        if not r:
-            raise HTTPException(404, "Пресет не найден")
-        pr = preset_json(r)
-        try:
-            spec = preset_banner_spec(pr)
-        except ValueError as e:
-            raise HTTPException(400, str(e)) from None
-        ids = [c["id"] for c in d.tiktok_clips()]
+        """Пресет баннеров и/или стикеров применяется ко всем клипам вкладки; прежний вариант и его файлы удаляются
+        (остаются оригинал и последний вариант)."""
+        if not body.preset_id and not body.sticker_preset_id:
+            raise HTTPException(400, "Выбери пресет баннеров или пресет стикеров")
+        pr = spec = sp = None
+        if body.preset_id:
+            r = d.preset(body.preset_id)
+            if not r:
+                raise HTTPException(404, "Пресет не найден")
+            pr = preset_json(r)
+            try:
+                spec = preset_banner_spec(pr)
+            except ValueError as e:
+                raise HTTPException(400, str(e)) from None
+        if body.sticker_preset_id:
+            r = d.sticker_preset(body.sticker_preset_id)
+            if not r:
+                raise HTTPException(404, "Пресет стикеров не найден")
+            sp = sticker_json(r)
+            if not stk.library(cfg):
+                raise HTTPException(400, "В папке стикеров нет картинок")
+        ids = [c["id"] for c in d.tiktok_clips() if body.clip_ids is None or c["id"] in set(body.clip_ids)]
         if not ids:
-            raise HTTPException(400, "Во вкладке нет клипов")
+            raise HTTPException(400, "Не выбрано ни одного клипа")
+        label = " + ".join(x["name"] for x in (pr, sp) if x)
 
-        def fn(log):
+        def fn(log0):
+            def log(m):
+                log0(m)
+                ttlog(m)
             db2 = DB(cfg["paths"]["db"], init=False)
+            log(f"Применяю «{label}» к клипам: {len(ids)}")
+            ok = bad = 0
             for n, cid in enumerate(ids, 1):
                 c = db2.clip(cid)
                 if not c or c["status"] != "tiktok":
                     continue
+                try:
+                    _tt_apply_one(db2, c, cid, n, log)
+                    ok += 1
+                except Exception as e:  # noqa: BLE001
+                    bad += 1
+                    log(f"ОШИБКА, клип #{cid}: {e}")
+            log(f"Готово: {ok} клип(ов)" + (f", с ошибкой: {bad}" if bad else ""))
+            return {"clips": len(ids), "preset": label}
+
+        def _tt_apply_one(db2, c, cid, n, log):
+            if True:
                 upd = tt_strip_preset(c)
-                if pr["tags"]:
+                if pr and pr["tags"]:
                     upd["tags"] = normalize_tags((upd.get("tags", c["tags"]) or "") + " " + pr["tags"])
-                if pr["footer"]:
+                if pr and pr["footer"]:
                     base = upd.get("reason", c["reason"]) or ""
                     upd["reason"] = (base.rstrip() + "\n\n" + pr["footer"]).strip()
                 if spec:
                     upd["banner"] = spec
-                upd["tt_preset"] = json.dumps({"id": pr["id"], "name": pr["name"], "tags": pr["tags"], "footer": pr["footer"]}, ensure_ascii=False)
+                if sp:
+                    lay = stk.layout(sp, cfg, f"{cid}:{sp['id']}:{time.time_ns()}")
+                    lay["preset"] = sp["name"]
+                    upd["stickers"] = stk.to_json(lay)
+                upd["tt_preset"] = json.dumps({"id": pr["id"] if pr else None, "name": label, "tags": pr["tags"] if pr else "",
+                                               "footer": pr["footer"] if pr else ""}, ensure_ascii=False)
                 db2.update_clip(cid, **upd)
-                if spec:
-                    log(f"Клип {n}/{len(ids)}: накладываю пресет «{pr['name']}»...")
-                    bn.ensure_final(db2, db2.clip(cid), cfg, log)
-            return {"clips": len(ids), "preset": pr["name"]}
-        return started("tiktok-preset", f"TikTok: пресет «{pr['name']}»", fn)
+                if spec or sp:
+                    log(f"Клип {n}/{len(ids)}: накладываю «{label}»...")
+                    fin = bn.ensure_final(db2, db2.clip(cid), cfg, log)
+                    log(f"Клип #{cid}: готово — {Path(fin).name if fin else 'файл не создан'}")
+        return started("tiktok-preset", f"TikTok: {label}", fn)
 
     @app.post("/api/tiktok/reset")
-    def tt_reset(d: DB = Depends(get_db)):
-        """Убирает последний пресет: остаются только оригиналы."""
+    def tt_reset(body: Optional[TikTokIdsIn] = None, d: DB = Depends(get_db)):
+        """Убирает последний пресет у выбранных клипов (по умолчанию у всех): остаются только оригиналы."""
+        only = set(body.clip_ids) if body and body.clip_ids is not None else None
         n = 0
         for c in d.tiktok_clips():
+            if only is not None and c["id"] not in only:
+                continue
             d.update_clip(c["id"], **tt_strip_preset(c))
             n += 1
+        ttlog(f"Пресет убран у клипов: {n} (остались оригиналы)")
         return {"clips": n}
 
     @app.delete("/api/tiktok/clips")
-    def tt_delete_all(d: DB = Depends(get_db)):
-        """Очистка хранилища: удаляются и оригиналы, и клипы с последним пресетом, а затем исходные видео."""
+    def tt_delete_all(ids: str = "", d: DB = Depends(get_db)):
+        """Очистка хранилища: удаляются и оригиналы, и клипы с последним пресетом, а затем исходные видео.
+        ids=1,2,3 — только эти клипы, иначе все клипы вкладки."""
+        only = {int(x) for x in ids.split(",") if x.strip().isdigit()} if ids else None
         n = 0
         for c in d.tiktok_clips():
+            if only is not None and c["id"] not in only:
+                continue
             discard_clip(d, cfg, c["id"])
+            ttlog(f"Клип #{c['id']} удалён: {c['title'] or ''}".rstrip(": "))
             n += 1
         freed = sweep_sources(d, cfg)
+        ttlog(f"Удалено клипов: {n}, освобождено ~{round(freed / 1e6)} МБ")
         return {"deleted": n, "freed_mb": round(freed / 1e6)}
 
     def tt_account_json(r) -> dict:
@@ -1243,14 +1497,14 @@ def create_app(cfg: dict | None = None) -> FastAPI:
     @app.get("/api/banners/describe")
     def banner_describe(name: str, start: float = 3.0, duration: float = 0.0, width_percent: float = 100.0,
                         position: str = "center", duck_percent: int = 15, margin: int = 160,
-                        chroma: bool | None = None, chroma_color: str = ""):
+                        chroma: bool | None = None, chroma_color: str = "", speed: float = 1.0):
         p = library().get(name)
         if not p:
             raise HTTPException(404, "Баннер не найден")
         try:
             spec = bn.normalize_spec({"path": str(p), "start": start, "duration": duration, "width_percent": width_percent,
                                       "position": position, "duck_percent": duck_percent, "margin": margin,
-                                      "chroma": chroma, "chroma_color": chroma_color}, cfg)
+                                      "chroma": chroma, "chroma_color": chroma_color, "speed": speed}, cfg)
             return bn.describe_info(spec, cfg)
         except bn.BannerError as e:
             raise HTTPException(400, str(e)) from None

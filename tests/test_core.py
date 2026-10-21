@@ -794,3 +794,23 @@ def test_browser_profiles(monkeypatch, tmp_path):
     assert browser.open_url("http://x/", str(exe), logs.append, "tiktok.acc@gmail.com") is True
     assert calls[-1] == [str(exe), "--profile-directory=Profile 3", "http://x/"]
     assert browser.open_url("http://x/", str(exe), logs.append, "нет такого") is True and calls[-1] == [str(exe), "http://x/"] and "Profile 3" in logs[-1]
+
+
+@pytest.mark.skipif(not shutil.which("ffmpeg"), reason="нет ffmpeg")
+def test_banner_speed(tmp_path):
+    from narez.banner import apply_banner, default_spec, normalize_spec, probe
+    cfg = load_config(); cfg["clips"]["preset"] = "ultrafast"; cfg["_root"] = str(tmp_path)
+    base, img, vid, silent = _tools(tmp_path)
+    spec = default_spec(cfg, vid)
+    assert spec["speed"] == 1.0                                                       # по умолчанию без ускорения
+    assert normalize_spec({**spec, "speed": 5}, cfg)["speed"] == 2.0 and normalize_spec({**spec, "speed": 0}, cfg)["speed"] == 1.0
+    assert normalize_spec({"path": spec["path"]}, cfg)["speed"] == 1.0 and normalize_spec({**spec, "speed": "abc"}, cfg)["speed"] == 1.0
+    # видео-баннер 4 с при скорости ×2 идёт на экране 2 с (с 4-й по 6-ю), звук не обрывается и длина клипа не меняется
+    spec.update(start=4, duration=0, speed=2.0)
+    out = apply_banner(base, tmp_path / "fast.mp4", spec, cfg)
+    assert abs(probe(out)["duration"] - 12) < 0.3
+    assert _rgb_at(out, 5, 540, 960)[2] > 150 and _rgb_at(out, 5, 540, 960)[0] < 60
+    assert _rgb_at(out, 7, 540, 960) != _rgb_at(out, 5, 540, 960)
+    spec.update(speed=1.0)
+    slow = apply_banner(base, tmp_path / "norm.mp4", spec, cfg)
+    assert _rgb_at(slow, 7, 540, 960)[2] > 150                                        # без ускорения в 7-й секунде баннер ещё идёт

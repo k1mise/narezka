@@ -376,6 +376,7 @@ function updateRunBox() {
   if (stick) lg.scrollTop = lg.scrollHeight;
 }
 const platName = p => (PLAT[p] || ["", p])[1];
+const fmtMS = sec => { sec = Math.max(0, Math.round(sec || 0)); return `${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, "0")}`; };
 const fmtDur = sec => { sec = Math.round(sec); return sec >= 60 ? `${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, "0")}` : `${sec} с`; };
 /* окно публикации выбранных клипов: порядок выхода, промежуток, время начала */
 function publishWindow(ids) {
@@ -662,7 +663,7 @@ async function buildEditor(root) {
     return {w, h};
   }
   function bannerDur(s, b) {
-    return b.kind === "video" ? (s.duration > 0 ? Math.min(s.duration, b.duration) : b.duration) : (s.duration > 0 ? s.duration : cfg.banner_defaults.image.duration || 6);
+    return b.kind === "video" ? (s.duration > 0 ? Math.min(s.duration, b.duration / (s.speed || 1)) : b.duration / (s.speed || 1)) : (s.duration > 0 ? s.duration : cfg.banner_defaults.image.duration || 6);
   }
   const startOf = s => s.start_mode === "percent" ? c.duration * Math.min(Math.max(s.start_percent || 0, 0), 100) / 100 : s.start;
   function ensureOv(card, b) {
@@ -708,7 +709,9 @@ async function buildEditor(root) {
       const playing = card.frozen || !video.paused;
       if (e.volume !== userVol) e.volume = userVol;
       e.muted = video.muted;
-      if (Math.abs(e.currentTime - bt) > 0.35) e.currentTime = Math.max(0, bt);
+      const sp = Math.min(Math.max(s.speed || 1, 1), 2);
+      if (e.playbackRate !== sp) e.playbackRate = sp;
+      if (Math.abs(e.currentTime - bt * sp) > 0.35 * sp) e.currentTime = Math.max(0, bt * sp);
       if (playing && e.paused) e.play().catch(() => {});
       if (!playing && !e.paused) e.pause();
     }
@@ -727,7 +730,7 @@ async function buildEditor(root) {
     const F = card.F, s = card.sel;
     if (!F.start || !F.start.isConnected) return {...s};
     return {name: s.name, start: +F.start.value || 0, start_mode: F.mode.value, start_percent: +F.pct.value || 0, duration: +F.duration.value,
-      width_percent: +F.width.value, position: F.pos.value, margin: +F.margin.value, duck_percent: +F.duck.value, pause: !!F.pause.checked,
+      width_percent: +F.width.value, position: F.pos.value, margin: +F.margin.value, duck_percent: +F.duck.value, pause: !!F.pause.checked, speed: s.speed || 1,
       ...(F.chroma ? {chroma: !!F.chroma.checked, chroma_color: F.chromaColor.value} : {})};
   }
   const specsNow = () => cards.filter(k => k.sel && !k.choosing).map(specOf);
@@ -837,7 +840,7 @@ async function buildEditor(root) {
       if (!card.sel || !card.F.start || !card.F.start.isConnected) return;
       const s = specOf(card);
       try {
-        const q = new URLSearchParams({name: s.name, start: s.start, duration: s.duration, width_percent: s.width_percent, position: s.position, duck_percent: s.duck_percent, margin: s.margin});
+        const q = new URLSearchParams({name: s.name, start: s.start, duration: s.duration, width_percent: s.width_percent, position: s.position, duck_percent: s.duck_percent, margin: s.margin, speed: s.speed || 1});
         if (s.chroma !== undefined) { q.set("chroma", s.chroma ? "true" : "false"); q.set("chroma_color", s.chroma_color || ""); }
         const d = await api("GET", "/api/banners/describe?" + q);
         card.info.className = "note " + (d.ok ? "ok" : "warn"); card.info.textContent = d.text;
@@ -1122,12 +1125,14 @@ async function pageBannerPresets(page) {
           const col = h("input", {type: "color", value: sp.chroma_color || b.key || "#00ff00", disabled: !sp.chroma, style: {width: "40px", height: "28px", padding: "0", border: "none", background: "none"}, onchange: () => { sp.chroma_color = col.value; }});
           chroma = h("div", {class: "row", style: {gap: "8px"}}, h("label", {class: "check"}, cc, h("span", {}, "Убрать однотонный фон")), col);
         }
+        if (isVideo && sp.speed == null) sp.speed = 1;
         return h("div", {class: "bncard"}, h("div", {class: "row", style: {marginBottom: "10px"}}, h("b", {}, `Баннер ${idx + 1}`), file, up,
           h("button", {class: "btn sm danger", onclick: () => { p.banners.splice(idx, 1); drawBanners(); }}, "Убрать")),
           h("div", {class: "row", style: {alignItems: "end", gap: "12px"}},
             h("div", {class: "field"}, h("label", {}, "Начало"), mode),
             sp.start_mode === "percent" ? num(sp, "start_percent", "Начало, % видео", 1, 0, 99) : num(sp, "start", "Начало, с", 0.5, 0, 3600),
             num(sp, "duration", isVideo ? "Длительность, с (0 = целиком)" : "Длительность, с", 0.5, 0, 600),
+            isVideo ? num(sp, "speed", "Скорость ×(1–2)", 0.1, 1, 2) : null,
             num(sp, "width_percent", "Ширина, %", 5, 10, 100),
             h("div", {class: "field"}, h("label", {}, "Положение"), pos),
             num(sp, "margin", "Отступ, px", 10, 0, 800), num(sp, "duck_percent", "Громкость основного, %", 5, 0, 100),
@@ -1469,11 +1474,21 @@ async function ttCopy(text, label) {
   catch (e) { const t = h("textarea", {style: {position: "fixed", opacity: 0}}, text); document.body.append(t); t.select(); try { document.execCommand("copy"); toast(label ? `Скопировано: ${label}` : "Скопировано"); } catch (er) { fail(er); } t.remove(); }
 }
 async function ttCopyAll(c, useP) {
-  const path = useP ? c.path_preset : c.path_original;
-  // в буфер по очереди: путь, описание, название — в истории буфера Windows (Win+V) лежат все три, последним — название
+  // если у клипа есть изменённая версия (баннер/стикеры/пресет) — путь берём к ней, иначе к оригиналу
+  const edited = useP && c.path_preset;
+  const path = edited ? c.path_preset : c.path_original;
+  // по очереди: путь, описание, название — в истории Win+V лежат все три, последним название
+  const items = [path, c.text, c.title];
+  const done = () => toast(`Скопировано в буфер: путь к ${edited ? "изменённому видео" : "оригиналу"}, описание, название (Win+V — история буфера)`);
+  toast("Копирую: путь → описание → название (около 3 секунд)…");
+  try { await api("POST", "/api/clipboard", {items, delay: 1.5}); return done(); }
+  catch (e) { /* не Windows или нет PowerShell — копируем средствами браузера */ }
   try {
-    for (const t of [path, c.text, c.title]) { await navigator.clipboard.writeText(t); await new Promise(r => setTimeout(r, 250)); }
-    toast("Скопировано в буфер: путь к файлу, описание, название (Win+V — история буфера)");
+    for (let i = 0; i < items.length; i++) {
+      await navigator.clipboard.writeText(items[i]);
+      await new Promise(r => setTimeout(r, i < items.length - 1 ? 1500 : 300));
+    }
+    done();
   } catch (e) { fail(new Error("Браузер не дал записать в буфер обмена: " + e.message)); }
 }
 function pageTikTok(page) {
@@ -1488,39 +1503,53 @@ function pageTikTok(page) {
     if (S.ttSticker) stickerSel.value = S.ttSticker;
     const used = [...new Set(T.clips.map(c => c.preset).filter(Boolean))];
     note.textContent = T.clips.length ? `Клипов: ${T.clips.length}. ` + (used.length ? `Сейчас применён пресет: ${used.join(", ")}.` : "Пресет не применён — у всех клипов только оригинал.") : "";
-    list.replaceChildren(...T.clips.map(ttCard));
+    const off = S.ttOff || (S.ttOff = new Set());
+    const sel = {has: id => !off.has(id), toggle: (id, on) => { on ? off.delete(id) : off.add(id); count(); }};
+    list.replaceChildren(...T.clips.map(c => ttCard(c, sel)));
+    count();
     del.hidden = !T.clips.length;
     empty.hidden = !!T.clips.length;
   };
   const note = h("span", {class: "muted small grow"});
+  const chosen = () => T.clips.filter(c => !(S.ttOff || new Set()).has(c.id)).map(c => c.id);
+  const selInfo = h("span", {class: "muted small"});
+  const count = () => { const n = chosen().length; selInfo.textContent = T.clips.length ? `Выбрано клипов: ${n} из ${T.clips.length}` : ""; };
+  const selAll = h("button", {class: "btn sm", onclick: () => { (S.ttOff || (S.ttOff = new Set())).clear(); draw(); }}, "Выбрать все");
+  const selNone = h("button", {class: "btn sm", onclick: () => { S.ttOff = new Set(T.clips.map(c => c.id)); draw(); }}, "Снять выбор");
+  const need = () => { const ids = chosen(); if (!ids.length) { toast("Отметь галочками клипы, к которым это относится", "err"); return null; } return ids; };
   presetSel.onchange = () => { S.ttPreset = Number(presetSel.value) || null; };
   stickerSel.onchange = () => { S.ttSticker = Number(stickerSel.value) || null; };
   const run = async (fn, okMsg) => { try { await fn(); } catch (e) { fail(e); } };
   const apply = h("button", {class: "btn primary", onclick: () => run(async () => {
     if (!S.ttPreset && !S.ttSticker) return toast("Выбери пресет баннеров и/или пресет стикеров", "err");
-    const t = await api("POST", "/api/tiktok/preset", {preset_id: S.ttPreset || undefined, sticker_preset_id: S.ttSticker || undefined}); startTracking(t); toast("Применяю пресет ко всем клипам… (прошлый вариант с пресетом будет удалён)"); }) }, "Применить к клипам");
+    const ids = need(); if (!ids) return;
+    const t = await api("POST", "/api/tiktok/preset", {preset_id: S.ttPreset || undefined, sticker_preset_id: S.ttSticker || undefined, clip_ids: ids}); startTracking(t); toast(`Применяю пресет к выбранным клипам (${ids.length})… прошлый вариант с пресетом будет удалён`); }) }, "Применить к выбранным");
   const reset = h("button", {class: "btn", title: "Убрать последний пресет: останутся только оригиналы", onclick: () => run(async () => {
-    await api("POST", "/api/tiktok/reset"); await loadTikTok(); toast("Пресет убран, остались оригиналы"); render(); }) }, "Убрать пресет");
-  const del = h("button", {class: "btn danger", onclick: () => confirmBox("Удалить все клипы вкладки?", "Будут удалены и оригиналы, и клипы с последним пресетом (и исходное видео, если оно больше не нужно). Это освободит место на диске, вернуть файлы нельзя.", "Удалить всё", () => run(async () => {
-    const r = await api("DELETE", "/api/tiktok/clips"); await loadTikTok(); toast(`Удалено клипов: ${r.deleted}, освобождено ~${r.freed_mb} МБ`); render(); })) }, "Удалить все клипы и освободить место");
+    const ids = need(); if (!ids) return;
+    await api("POST", "/api/tiktok/reset", {clip_ids: ids}); await loadTikTok(); toast("Пресет убран у выбранных, остались оригиналы"); render(); }) }, "Убрать пресет у выбранных");
+  const del = h("button", {class: "btn danger", onclick: () => { const ids = need(); if (!ids) return; confirmBox(`Удалить выбранные клипы (${ids.length})?`, "Будут удалены и оригиналы, и клипы с последним пресетом (и исходное видео, если оно больше не нужно). Это освободит место на диске, вернуть файлы нельзя.", "Удалить", () => run(async () => {
+    const r = await api("DELETE", "/api/tiktok/clips?ids=" + ids.join(",")); await loadTikTok(); toast(`Удалено клипов: ${r.deleted}, освобождено ~${r.freed_mb} МБ`); render(); })); }}, "Удалить выбранные и освободить место");
   const empty = h("div", {class: "card empty"}, h("b", {}, "Здесь пока пусто"), "На «Панели» вставь ссылку и отметь «Для ручной выкладки в TikTok» — нарезанные клипы без баннера появятся здесь.",
     h("div", {style: {marginTop: "14px"}}, h("button", {class: "btn primary", onclick: () => go("panel")}, "Перейти на «Панель»")));
   page.append(h("div", {class: "card tt-block"}, h("h2", {}, "Пресеты для всех клипов", h("small", {}, "баннеры и/или стикеры; остаются оригинал + последний вариант")),
-      h("div", {class: "row", style: {gap: "10px", flexWrap: "wrap"}}, presetSel, stickerSel, apply, reset, note)),
-    empty, list, h("div", {class: "row", style: {justifyContent: "flex-end"}}, del));
+      h("div", {class: "row", style: {gap: "10px", flexWrap: "wrap"}}, presetSel, stickerSel, apply, reset, note),
+      h("div", {class: "row", style: {gap: "8px", flexWrap: "wrap", marginTop: "8px", alignItems: "center"}}, selAll, selNone, selInfo)),
+    empty, list, h("div", {class: "row", style: {justifyContent: "flex-end"}}, del), ttLogCard());
   draw();
   api("GET", "/api/presets").then(p => { S.presets = p; draw(); }).catch(() => {});
   loadStickers().then(draw);
   loadTikTok().then(() => { if (S.page === "tiktok" && page.isConnected) { T.clips = S.tt.clips; draw(); } });
 }
-function ttCard(c) {
+function ttCard(c, sel) {
   const hasP = c.has_preset_file;
   let useP = hasP;
   const video = h("video", {controls: true, playsinline: true, preload: "metadata", poster: `/api/clips/${c.id}/thumb`});
   const setSrc = () => { video.src = `/api/clips/${c.id}/video?${useP ? "variant=final&" : ""}t=${Date.now()}`; };
-  setSrc();
+  const lenEl = h("div", {class: "tt-len small", title: "Длина видео в минутах:секундах"});
+  const showLen = () => { const v = useP && c.length_preset ? c.length_preset : (c.length_original || c.duration); lenEl.textContent = `Длина: ${fmtMS(v)}`; };
+  setSrc(); showLen();
   const seg = h("div", {class: "seg"}, [["o", "Оригинал"], ["p", c.preset ? `С пресетом «${c.preset}»` : "С пресетом"]].map(([k, t]) =>
-    h("button", {"data-k": k, disabled: k === "p" && !hasP, class: (k === "p") === useP ? "on" : "", onclick: e => { useP = k === "p"; seg.querySelectorAll("button").forEach(b => b.classList.toggle("on", (b.dataset.k === "p") === useP)); setSrc(); }}, t)));
+    h("button", {"data-k": k, disabled: k === "p" && !hasP, class: (k === "p") === useP ? "on" : "", onclick: e => { useP = k === "p"; seg.querySelectorAll("button").forEach(b => b.classList.toggle("on", (b.dataset.k === "p") === useP)); setSrc(); showLen(); }}, t)));
   const title = h("input", {type: "text", value: c.title});
   const desc = h("textarea", {rows: 5}, c.description);
   const tags = h("input", {type: "text", value: c.tags, placeholder: "#теги"});
@@ -1531,10 +1560,12 @@ function ttCard(c) {
   [title, desc, tags].forEach(el => el.addEventListener("change", save));
   const curPath = () => useP ? c.path_preset : c.path_original;
   const full = () => (desc.value.trim() + (tags.value.trim() ? "\n\n" + tags.value.trim() : "")).trim();
+  const pick = h("input", {type: "checkbox", checked: sel ? sel.has(c.id) : true, title: "Применять к этому клипу пресеты и удалять его вместе с выбранными", onchange: () => sel && sel.toggle(c.id, pick.checked)});
   return h("div", {class: "card tt-card"},
-    h("div", {class: "tt-frame"}, video),
+    h("div", {class: "tt-frame"}, h("label", {class: "tt-pick small"}, pick, " в выборке"), video),
     h("div", {class: "tt-body"},
       c.preset || hasP ? seg : h("div", {class: "muted small"}, "Только оригинал (пресет не применён)"),
+      lenEl,
       h("label", {class: "muted small"}, "Название"), title,
       h("label", {class: "muted small"}, "Описание"), desc,
       h("label", {class: "muted small"}, "Теги"), tags,
@@ -1565,3 +1596,21 @@ async function init() {
   setInterval(async () => { try { S.health = await api("GET", "/api/health"); renderHealth(); } catch (e) {} }, 15000);
 }
 init();
+
+function ttLogCard() {
+  const pre = h("pre", {class: "tt-log"}, "Журнала пока нет.");
+  const load = async () => {
+    try {
+      const r = await api("GET", "/api/tiktok/log");
+      const atEnd = pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 20;
+      pre.textContent = r.lines.length ? r.lines.join("\n") : "Журнала пока нет: здесь появятся наложение баннеров и стикеров, сброс пресетов, удаление клипов и ошибки.";
+      if (atEnd) pre.scrollTop = pre.scrollHeight;
+    } catch (e) { /* сервер недоступен — не мешаем */ }
+  };
+  const card = h("div", {class: "card tt-block"}, h("h2", {}, "Журнал вкладки", h("small", {}, "наложение баннеров, удаление клипов, ошибки")), pre,
+    h("div", {class: "row", style: {gap: "8px", marginTop: "8px"}}, h("button", {class: "btn sm", onclick: load}, "Обновить"),
+      h("button", {class: "btn sm", onclick: async () => { try { await api("DELETE", "/api/tiktok/log"); load(); } catch (e) { fail(e); } }}, "Очистить")));
+  load();
+  const timer = setInterval(() => { if (!card.isConnected || S.page !== "tiktok") return clearInterval(timer); load(); }, 2500);
+  return card;
+}

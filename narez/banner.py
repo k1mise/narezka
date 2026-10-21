@@ -53,6 +53,9 @@ def probe(path: str | Path) -> dict:
             "has_audio": kind == "video" and any(s.get("codec_type") == "audio" for s in streams)}
 
 
+MAX_SPEED = 2.0
+
+
 def default_spec(cfg: dict, path: str | Path, kind: str | None = None) -> dict:
     bn = cfg["banner"]
     kind = kind or ("image" if Path(path).suffix.lower() in IMAGE_EXT else "video")
@@ -68,6 +71,7 @@ def default_spec(cfg: dict, path: str | Path, kind: str | None = None) -> dict:
         "margin": int(bn.get("margin", 160)),
         "duck_percent": int(bn.get("duck_percent", 15)),
         "pause": bool(bn.get("pause", False)),
+        "speed": 1.0,                # скорость видео-баннера: 1 = обычная, до 2 (звук ускоряется вместе с картинкой)
         **_chroma_defaults(cfg, path, video),
     }
 
@@ -90,6 +94,7 @@ def normalize_spec(d: dict, cfg: dict) -> dict:
             "margin": int(num("margin", dflt["margin"], 0, 800)),
             "duck_percent": int(num("duck_percent", dflt["duck_percent"], 0, 100)),
             "pause": bool(d.get("pause", dflt["pause"])),
+            "speed": round(num("speed", dflt["speed"], 1.0, MAX_SPEED), 2),
             **_chroma_norm(d, dflt)}
 
 
@@ -292,7 +297,9 @@ def describe_info(spec: dict, cfg: dict) -> dict:
         text = f"Картинка {info['w']}×{info['h']}, займёт {frac * 100:.0f}% экрана."
     else:
         snd = "со звуком" if info["has_audio"] else "без звука"
-        text = f"Видео {info['w']}×{info['h']}, {info['duration']:.1f} с, {snd}; займёт {frac * 100:.0f}% экрана"
+        sp_ = min(max(float(spec.get("speed") or 1.0), 1.0), MAX_SPEED)
+        shown = f"{info['duration']:.1f} с" if sp_ <= 1.0001 else f"{info['duration']:.1f} с → {info['duration'] / sp_:.1f} с при скорости ×{sp_:g}"
+        text = f"Видео {info['w']}×{info['h']}, {shown}, {snd}; займёт {frac * 100:.0f}% экрана"
         text += " ✓" if ok else f" — МЕНЬШЕ {min_area}%: даже с растягиванием на весь кадр не хватает места."
         if spec.get("chroma"):
             ei = effective_info(spec, info, cfg)
@@ -330,8 +337,10 @@ def _apply_one(base: Path, out: Path, spec: dict, cfg: dict, log=print, t0: floa
     if t0 >= clip_dur - 0.5:
         raise BannerError(f"Баннер должен начинаться раньше конца клипа ({clip_dur:.0f} с)")
     want = float(spec.get("duration") or 0)
+    speed = min(max(float(spec.get("speed") or 1.0), 1.0), MAX_SPEED) if binfo["kind"] == "video" else 1.0
     if binfo["kind"] == "video":
-        dur = binfo["duration"] if want <= 0 else min(want, binfo["duration"])
+        full = binfo["duration"] / speed         # сколько баннер идёт на экране с учётом ускорения
+        dur = full if want <= 0 else min(want, full)
     else:
         dur = want if want > 0 else float(cfg["banner"].get("duration", 6.0))
     pause = bool(spec.get("pause"))
@@ -364,7 +373,8 @@ def _apply_one(base: Path, out: Path, spec: dict, cfg: dict, log=print, t0: floa
         if spec.get("chroma"):
             crop = effective_info(spec, binfo, cfg)["crop"]
             pre = (f"crop={crop[0]}:{crop[1]}:{crop[2]}:{crop[3]}," if crop else "") + chroma_filter(spec, cfg) + ","
-        chain.append(f"[1:v]trim=duration={dur:.3f},setpts=PTS-STARTPTS+{t0:.3f}/TB,{pre}scale={bw}:{bh},setsar=1[bn]")
+        fast = f"setpts=(PTS-STARTPTS)/{speed:.4f}," if speed > 1.0001 else ""
+        chain.append(f"[1:v]{fast}trim=duration={dur:.3f},setpts=PTS-STARTPTS+{t0:.3f}/TB,{pre}scale={bw}:{bh},setsar=1[bn]")
     else:
         chain.append(f"[1:v]scale={bw}:{bh},format=rgba[bn]")
     chain.append(f"{vin}[bn]overlay=(W-w)/2:{y}:eof_action=pass:enable='between(t,{t0:.3f},{t1:.3f})'[v1]")
@@ -375,7 +385,8 @@ def _apply_one(base: Path, out: Path, spec: dict, cfg: dict, log=print, t0: floa
         amap, acodec = "[ma]", ["-c:a", "aac", "-b:a", "160k"]
     if binfo["has_audio"]:
         ms = int(t0 * 1000)
-        chain.append(f"[1:a]atrim=duration={dur:.3f},asetpts=PTS-STARTPTS,adelay={ms}:all=1[ba]")
+        tempo = f"atempo={speed:.4f}," if speed > 1.0001 else ""
+        chain.append(f"[1:a]{tempo}atrim=duration={dur:.3f},asetpts=PTS-STARTPTS,adelay={ms}:all=1[ba]")
         if minfo["has_audio"]:
             if pause:
                 chain.append(f"{ain}[ba]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[aout]")
@@ -429,7 +440,7 @@ def apply_banners(base: Path, out: Path, specs: list[dict], cfg: dict, log=print
     return out
 
 
-def ensure_final(db, clip, cfg: dict, log=print) -> Path:
+def _ensure_banners(db, clip, cfg: dict, log=print) -> Path:
     """Файл клипа для публикации: с баннером (собирается при необходимости) или исходный клип без баннера."""
     from . import filler
     if not filler.normalize(clip["filler"]):
@@ -449,7 +460,7 @@ def ensure_final(db, clip, cfg: dict, log=print) -> Path:
     return out
 
 
-def cached_final(clip, cfg: dict) -> Path | None:
+def _cached_banners(clip, cfg: dict) -> Path | None:
     """Актуальный готовый файл клипа для предпросмотра (с баннером и/или вставкой) или None."""
     from . import filler
     if not clip["path"]:
@@ -479,3 +490,34 @@ def _ensure_banner(db, clip, cfg: dict, log=print) -> Path:
     apply_banners(base, out, specs, cfg, log)
     db.update_clip(clip["id"], final_path=str(out), banner_applied=clip["banner"])
     return out
+
+
+def ensure_final(db, clip, cfg: dict, log=print) -> Path:
+    """Файл клипа для публикации: вставка, баннеры и стикеры (по порядку) или исходный клип без изменений."""
+    from . import stickers as st
+    out = _ensure_banners(db, clip, cfg, log)
+    spec = st.normalize(clip["stickers"])
+    if not spec:
+        return out
+    clip = db.clip(clip["id"]) or clip
+    dst = Path(clip["path"]).with_name(Path(clip["path"]).stem + ".st.mp4")
+    mk = st.marker(spec, out)
+    if clip["sticker_path"] and Path(clip["sticker_path"]) == dst and dst.exists() and clip["sticker_applied"] == mk:
+        return dst
+    st.apply(out, dst, spec, cfg, log)
+    db.update_clip(clip["id"], sticker_path=str(dst), sticker_applied=mk)
+    return dst
+
+
+def cached_final(clip, cfg: dict) -> Path | None:
+    """Актуальный готовый файл клипа для предпросмотра (вставка, баннеры, стикеры) или None."""
+    from . import stickers as st
+    inner = _cached_banners(clip, cfg)
+    spec = st.normalize(clip["stickers"])
+    if not spec:
+        return inner
+    src = inner or (Path(clip["path"]) if clip["path"] else None)
+    if not src or not src.exists():
+        return None
+    dst = Path(clip["sticker_path"]) if clip["sticker_path"] else None
+    return dst if dst and dst.exists() and clip["sticker_applied"] == st.marker(spec, src) else None
