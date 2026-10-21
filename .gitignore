@@ -11,5 +11,3 @@ workspace/
 __pycache__/
 *.pyc
 .pytest_cache/
-assets/fillers/*.mp4
-.env
