@@ -1325,3 +1325,175 @@ def test_tiktok_clip_lengths_and_preset_speed(env):
     assert p["banners"][0]["speed"] == 2.0
     p = c.post("/api/presets", json={"name": "S2", "banners": [{"name": "a.png"}]}).json()
     assert p["banners"][0]["speed"] == 1.0
+
+
+def test_tiktok_filler_and_presets_combine(env):
+    import subprocess
+    c, cfg, db, _ = env
+    lib = cfg["paths"]["workdir"] / "fillers"
+    lib.mkdir(exist_ok=True)
+    cfg.setdefault("filler", {})["dir"] = str(lib)
+    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i", "color=green:s=360x640:r=25:d=4", "-c:v", "libx264",
+                    "-pix_fmt", "yuv420p", str(lib / "green.mp4")], check=True)
+    c1, c2 = _tt_clip(db, cfg, 1), _tt_clip(db, cfg, 2)
+    for cid in (c1, c2):          # настоящий формат клипа: вставка собирается под кадр 1080×1920
+        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i", "testsrc=s=1080x1920:d=2:r=5", "-f", "lavfi", "-i", "sine=d=2",
+                        "-pix_fmt", "yuv420p", "-shortest", db.clip(cid)["path"]], check=True)
+    bdir = cfg["paths"]["workdir"] / "banners"
+    bdir.mkdir(exist_ok=True)
+    _png(bdir / "a.png")
+    pa = c.post("/api/presets", json={"name": "A", "banner": {"name": "a.png", "start": 0, "duration": 1}}).json()
+    get = lambda: {x["id"]: x for x in c.get("/api/tiktok/clips").json()}   # noqa: E731
+    assert c.post("/api/tiktok/filler", json={"clip_ids": [c1], "position": "left"}).status_code == 400
+    assert c.post("/api/tiktok/filler", json={"clip_ids": [], "position": "top"}).status_code == 400
+    assert c.post("/api/tiktok/filler", json={"clip_ids": [c1], "position": "top", "file": "нет.mp4"}).status_code == 404
+    # сначала пресет на первый клип, затем вставка на оба: пресет остаётся, вставка добавляется поверх него
+    assert wait_task(c, c.post("/api/tiktok/preset", json={"preset_id": pa["id"], "clip_ids": [c1]}).json(), 60)["status"] == "done"
+    before = get()[c1]["path_preset"]
+    t = wait_task(c, c.post("/api/tiktok/filler", json={"clip_ids": [c1, c2], "position": "top", "file": "green.mp4"}).json(), 120)
+    assert t["status"] == "done", t
+    g = get()
+    assert g[c1]["preset"] == "A" and g[c1]["filler"]["position"] == "top" and g[c1]["has_preset_file"] and g[c1]["path_preset"] != g[c1]["path_original"]
+    assert Path(g[c1]["path_preset"]).exists() and g[c1]["path_preset"].endswith(".ff.mp4") and before != g[c1]["path_preset"]
+    assert g[c2]["preset"] == "" and g[c2]["filler"]["position"] == "top" and g[c2]["has_preset_file"] and g[c2]["path_preset"].endswith(".filler.mp4")
+    # в обратную сторону: пресет на клип со вставкой — вставка остаётся
+    assert wait_task(c, c.post("/api/tiktok/preset", json={"preset_id": pa["id"], "clip_ids": [c2]}).json(), 60)["status"] == "done"
+    g = get()
+    assert g[c2]["preset"] == "A" and g[c2]["filler"]["position"] == "top" and g[c2]["path_preset"].endswith(".ff.mp4") and Path(g[c2]["path_preset"]).exists()
+    # убрать вставку: пресет остаётся, файл собирается заново без вставки
+    assert wait_task(c, c.post("/api/tiktok/filler", json={"clip_ids": [c1], "position": ""}).json(), 120)["status"] == "done"
+    g = get()
+    assert g[c1]["filler"] is None and g[c1]["preset"] == "A" and g[c1]["has_preset_file"] and g[c1]["path_preset"].endswith(".final.mp4")
+    assert Path(g[c1]["path_preset"]).exists() and not (Path(g[c1]["path_original"]).with_suffix("").parent / (Path(g[c1]["path_original"]).stem + ".filler.mp4")).exists()
+    # убрать пресет у клипа со вставкой — остаётся вставка; убрать и её — только оригинал
+    c.post("/api/tiktok/reset", json={"clip_ids": [c2]})
+    g = get()
+    assert g[c2]["filler"]["position"] == "top" and g[c2]["has_preset_file"] and g[c2]["path_preset"].endswith(".filler.mp4")
+    assert wait_task(c, c.post("/api/tiktok/filler", json={"clip_ids": [c2], "position": ""}).json(), 60)["status"] == "done"
+    g = get()
+    assert g[c2]["filler"] is None and not g[c2]["has_preset_file"]
+    assert any("Вставка" in x for x in c.get("/api/tiktok/log").json()["lines"])
+
+
+def test_tiktok_filler_error_restores_previous_variant(env, monkeypatch):
+    import subprocess
+    from narez import filler as fm
+    c, cfg, db, _ = env
+    lib = cfg["paths"]["workdir"] / "fillers"
+    lib.mkdir(exist_ok=True)
+    cfg.setdefault("filler", {})["dir"] = str(lib)
+    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i", "color=green:s=360x640:r=25:d=4", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(lib / "g.mp4")], check=True)
+    c1 = _tt_clip(db, cfg, 1)
+    bdir = cfg["paths"]["workdir"] / "banners"
+    bdir.mkdir(exist_ok=True)
+    _png(bdir / "a.png")
+    pa = c.post("/api/presets", json={"name": "A", "banner": {"name": "a.png", "start": 0, "duration": 1}}).json()
+    assert wait_task(c, c.post("/api/tiktok/preset", json={"preset_id": pa["id"]}).json(), 60)["status"] == "done"
+    monkeypatch.setattr(fm, "compose", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("сломалось")))
+    wait_task(c, c.post("/api/tiktok/filler", json={"clip_ids": [c1], "position": "top"}).json(), 60)
+    x = c.get("/api/tiktok/clips").json()[0]
+    assert x["filler"] is None and x["preset"] == "A" and x["has_preset_file"] and Path(x["path_preset"]).exists()
+    assert any("прежний вариант восстановлен" in l for l in c.get("/api/tiktok/log").json()["lines"])
+
+
+def test_tiktok_extension_file_endpoints(env):
+    c, cfg, db, _ = env
+    c1 = _tt_clip(db, cfg, 1)
+    path = Path(db.clip(c1)["path"])
+    size = path.stat().st_size
+    H = {"X-Narez-Helper": "1"}
+    assert c.get(f"/api/tiktok/clips/{c1}/fileinfo").status_code == 403                      # без заголовка расширения — нельзя
+    assert c.get(f"/api/tiktok/clips/{c1}/chunk").status_code == 403
+    info = c.get(f"/api/tiktok/clips/{c1}/fileinfo", headers=H).json()
+    assert info["size"] == size and info["name"] == path.name and info["type"] == "video/mp4"
+    data = b"".join(c.get(f"/api/tiktok/clips/{c1}/chunk?offset={o}&size=1000", headers=H).content for o in range(0, size, 1000))
+    assert data == path.read_bytes()                                                           # файл собирается из кусков без потерь
+    assert c.get(f"/api/tiktok/clips/{c1}/fileinfo?variant=final", headers=H).status_code == 404   # варианта с пресетом ещё нет
+    assert c.get(f"/api/tiktok/clips/999/fileinfo", headers=H).status_code == 404
+    assert c.get(f"/api/tiktok/clips/{c1}/note?msg=Описание вписано", headers=H).status_code == 200
+    assert any("TikTok Studio: Описание вписано" in x for x in c.get("/api/tiktok/log").json()["lines"])
+    assert c.get(f"/api/tiktok/clips/{c1}/note?msg=x").status_code == 403
+
+
+def wait_queue(c, pred, timeout=20):
+    for _ in range(int(timeout / 0.1)):
+        q = c.get("/api/queue").json()
+        if pred(q):
+            return q
+        time.sleep(0.1)
+    raise AssertionError(f"очередь не дошла до нужного состояния: {c.get('/api/queue').json()}")
+
+
+def test_queue_runs_links_one_by_one_and_keeps_going_after_error(env, monkeypatch):
+    c, cfg, db, app = env
+    g = c.post("/api/groups", json={"name": "Г"}).json()["id"]
+    order, active, peak = [], [0], [0]
+
+    def fake(src, cfg_, db_, gid, log, test=False, **kw):
+        active[0] += 1
+        peak[0] = max(peak[0], active[0])
+        order.append(src)
+        time.sleep(0.3)
+        active[0] -= 1
+        if src.endswith("/bad"):
+            raise RuntimeError("не скачалось")
+        return 1, []
+    monkeypatch.setattr("narez.web.server.run_pipeline", fake)
+    r = c.post("/api/queue", json={"urls": ["https://x.y/a", "https://x.y/bad", "https://x.y/c", "не ссылка", "https://x.y/a"], "group_id": g}).json()
+    assert r["added"] == 3 and len(r["rejected"]) == 2                    # мусор и повтор не принимаются
+    q = wait_queue(c, lambda q: not q["active"] and all(i["status"] in ("done", "error") for i in q["items"]))
+    assert [i["status"] for i in q["items"]] == ["done", "error", "done"]  # ошибка второй ссылки не остановила третью
+    assert "не скачалось" in q["items"][1]["error"]
+    assert order == ["https://x.y/a", "https://x.y/bad", "https://x.y/c"] and peak[0] == 1   # строго по одной
+    assert all(i["task_id"] for i in q["items"])
+    # повтор ссылки с ошибкой и уборка завершённых
+    assert c.post(f"/api/queue/{q['items'][1]['id']}/retry").status_code == 200
+    q = wait_queue(c, lambda q: not q["active"] and q["items"][1]["status"] == "error")
+    assert c.post("/api/queue/clear").json()["items"] == []
+    assert c.get("/api/queue").json()["items"] == []
+
+
+def test_queue_pause_and_clips_available_while_next_runs(env, monkeypatch):
+    c, cfg, db, app = env
+    g = c.post("/api/groups", json={"name": "Г"}).json()["id"]
+    gate = __import__("threading").Event()
+    p = Path(cfg["paths"]["workdir"]) / "clips"
+    p.mkdir()
+
+    def fake(src, cfg_, db_, gid, log, test=False, **kw):
+        if src.endswith("/one"):
+            j = db_.add_job(gid, src, "Один")
+            f = p / "1.mp4"
+            f.write_bytes(b"x")
+            db_.add_clip(j, str(f), Moment(0, 5, "Клип первого", "", 5))
+            return j, []
+        gate.wait(5)                                     # второе видео «ещё нарезается»
+        return 2, []
+    monkeypatch.setattr("narez.web.server.run_pipeline", fake)
+    c.post("/api/queue", json={"urls": ["https://x.y/one", "https://x.y/two"], "group_id": g})
+    wait_queue(c, lambda q: q["items"][0]["status"] == "done" and q["items"][1]["status"] == "running")
+    clips = c.get(f"/api/groups/{g}/clips").json()                 # клипы первого видео видны, хотя второе ещё идёт
+    assert [x["title"] for x in clips] == ["Клип первого"]
+    # новая ссылка при занятой очереди встаёт в хвост, а ручной запуск честно отвечает «занято»
+    assert c.post("/api/queue", json={"urls": ["https://x.y/three"], "group_id": g}).json()["added"] == 1
+    assert c.post("/api/process", json={"url": "https://x.y/m", "group_id": g}).status_code == 409
+    assert c.delete(f"/api/queue/{c.get('/api/queue').json()['items'][1]['id']}").status_code == 409   # идущую не убрать
+    c.post("/api/queue/pause")
+    gate.set()
+    q = wait_queue(c, lambda q: not q["active"])
+    assert [i["status"] for i in q["items"]] == ["done", "done", "pending"] and q["paused"]            # третья ждёт паузы
+    assert c.post("/api/queue/start").json()["paused"] is False
+    wait_queue(c, lambda q: not q["active"] and q["items"][2]["status"] == "done")
+
+
+def test_queue_survives_restart_as_paused(env, monkeypatch):
+    c, cfg, db, app = env
+    g = c.post("/api/groups", json={"name": "Г"}).json()["id"]
+    monkeypatch.setattr("narez.web.server.run_pipeline", lambda *a, **k: (time.sleep(5), (1, []))[1])
+    c.post("/api/queue", json={"urls": ["https://x.y/a", "https://x.y/b"], "group_id": g})
+    wait_queue(c, lambda q: q["items"][0]["status"] == "running")
+    app2 = create_app(cfg)                                   # «перезапуск»: файл очереди подхватывается
+    c2 = TestClient(app2)
+    q = c2.get("/api/queue").json()
+    assert [i["status"] for i in q["items"]] == ["error", "pending"] and q["paused"] and not q["active"]
+    assert "Прервано" in q["items"][0]["error"]

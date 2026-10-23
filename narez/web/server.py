@@ -7,13 +7,14 @@ import re
 import shutil
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse, urlsplit
 
 import requests
 from fastapi import Depends, FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -100,6 +101,14 @@ class ProcessIn(CutIn):
     tiktok: bool = False                # клипы для ручной выкладки в TikTok: без баннера, группа и шаблон не нужны
 
 
+class QueueIn(CutIn):
+    urls: list[str]
+    group_id: int = 0
+    test: bool = False
+    template_id: Optional[int] = None
+    tiktok: bool = False
+
+
 class ProxyAddIn(BaseModel):
     text: str
     scheme: str = "http"
@@ -140,6 +149,12 @@ class TikTokPresetIn(BaseModel):
     preset_id: Optional[int] = None            # пресет баннеров
     sticker_preset_id: Optional[int] = None    # пресет стикеров
     clip_ids: Optional[list[int]] = None       # к каким клипам применить (None — ко всем)
+
+
+class TikTokFillerIn(BaseModel):
+    clip_ids: Optional[list[int]] = None
+    position: str = ""        # top / bottom — поставить вставку; "" — убрать
+    file: str = ""            # "" — случайное видео из папки вставок
 
 
 class TikTokIdsIn(BaseModel):
@@ -498,8 +513,8 @@ def create_app(cfg: dict | None = None) -> FastAPI:
         return {"cancelled": cancel_login()}
 
     # ---------- нарезка ----------
-    @app.post("/api/process")
-    def process(body: ProcessIn, d: DB = Depends(get_db)):
+    def make_process_job(body: ProcessIn, d: DB):
+        """(название, fn(log)) для задачи нарезки; ошибки настроек — HTTPException. Общее для «Нарезать» и очереди ссылок."""
         if body.tiktok:
             gid, plan = None, []
         else:
@@ -518,7 +533,172 @@ def create_app(cfg: dict | None = None) -> FastAPI:
             job_id, clips = run_pipeline(url, eff_cfg(db2, log), db2, gid, log, test=body.test and not body.tiktok, **cut)
             fan_out(db2, job_id, plan, log)
             return {"job_id": job_id, "clips": len(clips) * max(1, len(plan))}
-        return started("process", f"{'TikTok: ' if body.tiktok else 'Тест: ' if body.test else 'Нарезка целиком: ' if body.mode == 'full' else 'Нарезка: '}{Path(url).name if not url.startswith('http') else url}", fn, exclusive=True)
+        title = f"{'TikTok: ' if body.tiktok else 'Тест: ' if body.test else 'Нарезка целиком: ' if body.mode == 'full' else 'Нарезка: '}{Path(url).name if not url.startswith('http') else url}"
+        return title, fn
+
+    @app.post("/api/process")
+    def process(body: ProcessIn, d: DB = Depends(get_db)):
+        title, fn = make_process_job(body, d)
+        return started("process", title, fn, exclusive=True)
+
+    # ---------- очередь ссылок ----------
+    # Ссылки обрабатываются строго по одной (скачивание и нарезка занимают процессор и видеокарту). Как только очередной ролик
+    # нарезан, его клипы сразу доступны в интерфейсе, пока скачивается и режется следующий. Очередь лежит в workspace/queue.json.
+    queue_file = wd / "queue.json"
+    qlock = threading.RLock()
+    qitems: list[dict] = []
+    qstate = {"paused": False, "thread": None}
+
+    def q_save() -> None:
+        try:
+            queue_file.write_text(json.dumps({"paused": qstate["paused"], "items": qitems}, ensure_ascii=False), encoding="utf-8")
+        except OSError:
+            pass
+
+    def q_load() -> None:
+        try:
+            data = json.loads(queue_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        for it in data.get("items", []):
+            if it.get("status") == "running":      # программу закрыли посреди нарезки — отметим, повторить можно кнопкой
+                it["status"], it["error"] = "error", "Прервано: программу закрыли или перезапустили до завершения"
+            qitems.append(it)
+        qstate["paused"] = bool(qitems and any(i["status"] == "pending" for i in qitems))   # после перезапуска сами не стартуем — ждём «Продолжить»
+
+    def q_public() -> dict:
+        with qlock:
+            alive = bool(qstate["thread"] and qstate["thread"].is_alive())
+            return {"items": [{k: i.get(k, "") for k in ("id", "url", "status", "error", "task_id", "title", "added", "tiktok", "mode")} for i in qitems],
+                    "paused": qstate["paused"], "active": alive}
+
+    def q_worker() -> None:
+        while True:
+            with qlock:
+                item = next((i for i in qitems if i["status"] == "pending"), None)
+                if item is None or qstate["paused"]:
+                    qstate["thread"] = None
+                    return
+                item["status"], item["error"] = "running", ""
+                q_save()
+            try:
+                body = ProcessIn(**item["body"])
+                d = DB(cfg["paths"]["db"], init=False)
+                title, fn = make_process_job(body, d)
+                item["title"] = title
+                while True:
+                    try:
+                        t = tasks.start("process", title, fn, exclusive=True)
+                        break
+                    except Busy:        # идёт ручная нарезка — ждём её конца
+                        time.sleep(2)
+                item["task_id"] = t.id
+                while t.status == "running":
+                    time.sleep(1)
+                item["status"] = "done" if t.status == "done" else "error"
+                item["error"] = "" if t.status == "done" else (t.error or "Ошибка нарезки")
+            except HTTPException as e:
+                item["status"], item["error"] = "error", str(e.detail)
+            except Exception as e:      # одна ссылка не должна останавливать всю очередь
+                item["status"], item["error"] = "error", f"{type(e).__name__}: {e}"
+            with qlock:
+                q_save()
+
+    def q_kick() -> None:
+        with qlock:
+            if qstate["thread"] and qstate["thread"].is_alive():
+                return
+            if qstate["paused"] or not any(i["status"] == "pending" for i in qitems):
+                return
+            th = qstate["thread"] = threading.Thread(target=q_worker, daemon=True, name="narez-queue")
+            th.start()
+
+    q_load()
+
+    @app.get("/api/queue")
+    def queue_get():
+        return q_public()
+
+    @app.post("/api/queue")
+    def queue_add(body: QueueIn, d: DB = Depends(get_db)):
+        urls = [u.strip() for u in body.urls if u and u.strip()]
+        if not urls:
+            raise HTTPException(400, "Нет ссылок")
+        if len(urls) > 100:
+            raise HTTPException(400, "За раз можно добавить до 100 ссылок")
+        proto = body.model_dump() if hasattr(body, "model_dump") else body.dict()
+        proto.pop("urls", None)
+        if not body.tiktok:                                   # настройки проверяем сразу, а не когда дойдёт очередь
+            resolve_target(d, body.group_id, body.template_id)
+        cut_args(body)
+        added, rejected = 0, []
+        with qlock:
+            pending_urls = {i["url"] for i in qitems if i["status"] in ("pending", "running")}
+            for u in urls:
+                try:
+                    norm = normalize_source(u)
+                except SourceError as e:
+                    rejected.append({"url": u, "error": str(e)})
+                    continue
+                if norm in pending_urls:
+                    rejected.append({"url": u, "error": "Уже в очереди"})
+                    continue
+                pending_urls.add(norm)
+                qitems.append({"id": uuid.uuid4().hex[:10], "url": norm, "status": "pending", "error": "", "task_id": "", "title": "", "added": time.time(),
+                               "tiktok": bool(body.tiktok), "mode": body.mode, "body": {**proto, "url": norm}})
+                added += 1
+            if added:
+                qstate["paused"] = False
+                q_save()
+        q_kick()
+        return {**q_public(), "added": added, "rejected": rejected}
+
+    @app.post("/api/queue/start")
+    def queue_start():
+        with qlock:
+            qstate["paused"] = False
+            q_save()
+        q_kick()
+        return q_public()
+
+    @app.post("/api/queue/pause")
+    def queue_pause():
+        """Текущая нарезка дойдёт до конца, следующие ссылки ждут."""
+        with qlock:
+            qstate["paused"] = True
+            q_save()
+        return q_public()
+
+    @app.post("/api/queue/clear")
+    def queue_clear():
+        with qlock:
+            qitems[:] = [i for i in qitems if i["status"] in ("pending", "running")]
+            q_save()
+        return q_public()
+
+    @app.delete("/api/queue/{item_id}")
+    def queue_remove(item_id: str):
+        with qlock:
+            it = next((i for i in qitems if i["id"] == item_id), None)
+            if not it:
+                raise HTTPException(404, "Нет такой ссылки в очереди")
+            if it["status"] == "running":
+                raise HTTPException(409, "Эта ссылка сейчас обрабатывается — дождись конца нарезки")
+            qitems.remove(it)
+            q_save()
+        return q_public()
+
+    @app.post("/api/queue/{item_id}/retry")
+    def queue_retry(item_id: str):
+        with qlock:
+            it = next((i for i in qitems if i["id"] == item_id), None)
+            if not it or it["status"] != "error":
+                raise HTTPException(404, "Повторить можно только ссылку с ошибкой")
+            it["status"], it["error"] = "pending", ""
+            qstate["paused"] = False
+            q_save()
+        q_kick()
+        return q_public()
 
     @app.get("/api/tasks")
     def task_list():
@@ -1078,6 +1258,15 @@ def create_app(cfg: dict | None = None) -> FastAPI:
     def tt_clips(d: DB = Depends(get_db)):
         return [tt_clip_json(c, d) for c in d.tiktok_clips()]
 
+    def rm_in_workdir(fin, keep) -> None:
+        """Удаляет собранный файл варианта клипа (только внутри рабочей папки и не сам клип)."""
+        if fin and fin != keep:
+            try:
+                if Path(fin).is_file() and Path(fin).resolve().is_relative_to(wd.resolve()):
+                    Path(fin).unlink()
+            except OSError:
+                pass
+
     def tt_strip_preset(c) -> dict:
         """Поля клипа без текста прежнего пресета (его теги и подпись), баннер и готовый файл убираются."""
         try:
@@ -1091,12 +1280,7 @@ def create_app(cfg: dict | None = None) -> FastAPI:
             drop = {t.lower() for t in old["tags"].split()}
             upd["tags"] = " ".join(t for t in (c["tags"] or "").split() if t.lower() not in drop)
         for fin in (c["final_path"], c["sticker_path"]):
-            if fin and fin != c["path"]:
-                try:
-                    if Path(fin).is_file() and Path(fin).resolve().is_relative_to(wd.resolve()):
-                        Path(fin).unlink()
-                except OSError:
-                    pass
+            rm_in_workdir(fin, c["path"])
         upd.update(banner="", final_path="", banner_applied="", tt_preset="", stickers="", sticker_path="", sticker_applied="")
         return upd
 
@@ -1171,6 +1355,64 @@ def create_app(cfg: dict | None = None) -> FastAPI:
                     log(f"Клип #{cid}: готово — {Path(fin).name if fin else 'файл не создан'}")
         return started("tiktok-preset", f"TikTok: {label}", fn)
 
+    @app.post("/api/tiktok/filler")
+    def tt_apply_filler(body: TikTokFillerIn, d: DB = Depends(get_db)):
+        """Видео-вставка для выбранных клипов вкладки. Пресет баннеров и стикеров клипа не трогается: вставка применяется
+        к клипу вместе с ним (баннеры и стикеры ложатся поверх кадра со вставкой). position="" — вставка убирается."""
+        pos = (body.position or "").strip()
+        if pos and pos not in filler_mod.POSITIONS:
+            raise HTTPException(400, "Расположение вставки: сверху или снизу")
+        spec = None
+        if pos:
+            if not filler_mod.library(cfg):
+                raise HTTPException(400, f"В папке вставок нет видео: {filler_mod.library_dir(cfg)}")
+            if body.file and body.file not in {p.name for p in filler_mod.library(cfg)}:
+                raise HTTPException(404, f"Видео «{body.file}» нет в папке вставок")
+            spec = {"position": pos, "file": body.file}
+        ids = [c["id"] for c in d.tiktok_clips() if body.clip_ids is None or c["id"] in set(body.clip_ids)]
+        if not ids:
+            raise HTTPException(400, "Не выбрано ни одного клипа")
+        label = ("сверху" if pos == "top" else "снизу") + (f", {body.file}" if body.file else ", случайное видео") if pos else "убрать"
+
+        def fn(log0):
+            def log(m):
+                log0(m)
+                ttlog(m)
+            db2 = DB(cfg["paths"]["db"], init=False)
+            log(f"Вставка ({label}) для клипов: {len(ids)}")
+            ok = bad = 0
+            for n, cid in enumerate(ids, 1):
+                c = db2.clip(cid)
+                if not c or c["status"] != "tiktok":
+                    continue
+                old_filler = c["filler"] or ""
+                try:
+                    for key in ("filler_path", "final_path", "sticker_path"):     # собранные поверх старой вставки файлы устарели
+                        rm_in_workdir(c[key], c["path"])
+                    db2.update_clip(cid, filler=json.dumps(spec, ensure_ascii=False) if spec else "", filler_path="", filler_applied="",
+                                    final_path="", banner_applied="", sticker_path="", sticker_applied="")
+                    c = db2.clip(cid)
+                    if filler_mod.normalize(c["filler"]) or bn.specs_from_json(c["banner"]) or c["stickers"]:
+                        log(f"Клип {n}/{len(ids)} (#{cid}): собираю" + (" со вставкой" if spec else " без вставки, остальное сохраняю") + "...")
+                        fin = bn.ensure_final(db2, c, cfg, log)
+                        log(f"Клип #{cid}: готово — {Path(fin).name}")
+                    else:
+                        log(f"Клип #{cid}: вставка убрана, остался оригинал")
+                    ok += 1
+                except Exception as e:  # noqa: BLE001
+                    bad += 1
+                    log(f"ОШИБКА, клип #{cid}: {e}")
+                    try:      # возвращаем клип как был: прежняя вставка (или её отсутствие) и всё, что на нём собрано
+                        db2.update_clip(cid, filler=old_filler, filler_path="", filler_applied="", final_path="", banner_applied="", sticker_path="", sticker_applied="")
+                        c2 = db2.clip(cid)
+                        if filler_mod.normalize(c2["filler"]) or bn.specs_from_json(c2["banner"]) or c2["stickers"]:
+                            bn.ensure_final(db2, c2, cfg, lambda *_: None)
+                        log(f"Клип #{cid}: прежний вариант восстановлен")
+                    except Exception as e2:  # noqa: BLE001
+                        log(f"Клип #{cid}: не удалось восстановить прежний вариант: {e2}")
+            log(f"Готово: {ok} клип(ов)" + (f", с ошибкой: {bad}" if bad else ""))
+        return started("tiktok-filler", f"TikTok: вставка ({label})", fn)
+
     @app.post("/api/tiktok/reset")
     def tt_reset(body: Optional[TikTokIdsIn] = None, d: DB = Depends(get_db)):
         """Убирает последний пресет у выбранных клипов (по умолчанию у всех): остаются только оригиналы."""
@@ -1241,6 +1483,49 @@ def create_app(cfg: dict | None = None) -> FastAPI:
             raise HTTPException(404, "Аккаунт не найден")
         tt_armed.clear()
         tt_armed[acc_id] = time.time() + 60
+        return {"ok": True}
+
+    def tt_variant_file(c, variant: str) -> Path:
+        """Файл клипа для загрузки в TikTok: final — со вставкой/баннерами/стикерами (если собран), иначе оригинал."""
+        path = None
+        if variant == "final":
+            fin = bn.cached_final(c, cfg)
+            path = str(fin) if fin else None
+        else:
+            path = c["path"]
+        if not path or not Path(path).is_file():
+            raise HTTPException(404, "Файл клипа не найден (возможно, вариант с пресетом ещё не собран)")
+        return Path(path)
+
+    def need_helper(request: Request):
+        if request.headers.get("x-narez-helper") != "1":
+            raise HTTPException(403, "Только для расширения narez")
+
+    @app.get("/api/tiktok/clips/{clip_id}/fileinfo")
+    def tt_fileinfo(clip_id: int, request: Request, variant: str = "original", d: DB = Depends(get_db)):
+        """Для расширения: размер и имя файла, который нужно положить в форму загрузки TikTok Studio."""
+        need_helper(request)
+        c = need_clip(d, clip_id)
+        p = tt_variant_file(c, variant)
+        return {"size": p.stat().st_size, "name": p.name, "type": "video/mp4"}
+
+    @app.get("/api/tiktok/clips/{clip_id}/chunk")
+    def tt_chunk(clip_id: int, request: Request, offset: int = 0, size: int = 4_000_000, variant: str = "original", d: DB = Depends(get_db)):
+        """Для расширения: кусок файла (расширение собирает файл из кусков — страница TikTok не может читать localhost напрямую)."""
+        need_helper(request)
+        c = need_clip(d, clip_id)
+        p = tt_variant_file(c, variant)
+        size = max(1, min(size, 8_000_000))
+        with open(p, "rb") as f:
+            f.seek(max(offset, 0))
+            data = f.read(size)
+        return Response(content=data, media_type="application/octet-stream", headers={"Cache-Control": "no-store"})
+
+    @app.get("/api/tiktok/clips/{clip_id}/note")
+    def tt_ext_log(clip_id: int, request: Request, msg: str = ""):
+        """Для расширения: что оно сделало на странице TikTok Studio (попадает в журнал вкладки). GET — чтобы не упираться в Origin расширения."""
+        need_helper(request)
+        ttlog(f"Клип #{clip_id}, TikTok Studio: " + msg[:300])
         return {"ok": True}
 
     @app.get("/api/tiktok/pending")

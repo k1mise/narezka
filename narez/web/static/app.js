@@ -178,6 +178,7 @@ async function pollTasks() {
       if (t.status === "running" && S.tracked) S.tracked.add(t.id);
     }
     S.tasks = list;
+    try { const q = await api("GET", "/api/queue"); const same = JSON.stringify(q) === JSON.stringify(S.queue); S.queue = q; (q.items || []).forEach(i => { if (i.task_id) S.tracked.add(i.task_id); }); if (!same && S.page === "panel") updateQueueBox(); } catch (e) { /* старый сервер без очереди */ }
     if (!S.tasksLoaded) { S.tasksLoaded = true; if (S.page === "panel" && list.length && !document.activeElement?.matches("input,textarea")) setTimeout(render, 0); }   // журнал прошлых запусков появляется после первой загрузки
     // лог активной задачи
     const act = list.find(t => t.status === "running") || list.find(t => t.id === S.trackId);
@@ -274,12 +275,14 @@ function pagePanel(page) {
         h("button", {class: "btn primary", onclick: () => go("accounts")}, "Перейти в «Аккаунты»"))));
     return;
   }
-  const url = h("input", {type: "text", placeholder: "Ссылка на видео (любой сайт), прямая ссылка на файл или путь к файлу", id: "url", autocomplete: "off", spellcheck: "false"});
+  const url = h("textarea", {rows: 1, placeholder: "Ссылка на видео (любой сайт), прямая ссылка на файл или путь к файлу. Несколько ссылок — по одной в строке: встанут в очередь", id: "url", autocomplete: "off", spellcheck: "false"});
+  const grow = () => { url.style.height = "auto"; url.style.height = Math.min(url.scrollHeight, 150) + "px"; };
+  url.addEventListener("input", grow);
   const testBox = h("input", {type: "checkbox", id: "testmode"});
   testBox.checked = !!S.testMode; testBox.onchange = () => { S.testMode = testBox.checked; };
   const ttBox = h("input", {type: "checkbox", id: "ttmode"});
   ttBox.checked = !!S.ttMode; ttBox.onchange = () => { S.ttMode = ttBox.checked; render(); };
-  url.addEventListener("keydown", e => { if (e.key === "Enter") start(); });
+  url.addEventListener("keydown", e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); start(); } });
   const startBtn = h("button", {class: "btn primary", id: "start", onclick: start}, "Нарезать");
   const tplSel = h("select", {style: {minWidth: "220px"}}, [h("option", {value: ""}, `Без шаблона — только группа «${g.name}»`),
     ...(S.templates || []).map(t => h("option", {value: t.id}, `Шаблон: ${t.name} (${t.items.map(i => i.group).join(", ")})`))]);
@@ -288,8 +291,18 @@ function pagePanel(page) {
   const tpl = (S.templates || []).find(t => t.id === S.tplId);
   async function start() {
     try {
-      const t = await api("POST", "/api/process", {url: url.value, group_id: S.gid, template_id: S.tplId || undefined, test: testBox.checked && !ttBox.checked, tiktok: ttBox.checked, ...cutPayload()});
-      startTracking(t); url.value = ""; toast(ttBox.checked ? "Запустил нарезку для TikTok — клипы появятся во вкладке «TikTok»" : "Запустил нарезку"); updateRunBox();
+      const links = parseLinks(url.value);
+      const q = S.queue || {items: []};
+      const busy = S.tasks.some(t => t.kind === "process" && t.status === "running") || q.active || q.items.some(i => i.status === "pending" || i.status === "running");
+      if (links.length > 1 || (links.length === 1 && busy)) {            // несколько ссылок или уже что-то нарезается — в очередь
+        const r = await api("POST", "/api/queue", {urls: links, group_id: S.gid, template_id: S.tplId || undefined, test: testBox.checked && !ttBox.checked, tiktok: ttBox.checked, ...cutPayload()});
+        S.queue = r; url.value = ""; grow(); updateQueueBox();
+        const bad = (r.rejected || []).map(x => `${x.url.slice(0, 50)}: ${x.error}`).join("; ");
+        toast(r.added ? `В очередь добавлено: ${r.added}` + (bad ? `. Не принято: ${bad}` : "") : `Ничего не добавлено: ${bad}`, r.added ? undefined : "err");
+        return;
+      }
+      const t = await api("POST", "/api/process", {url: url.value.trim(), group_id: S.gid, template_id: S.tplId || undefined, test: testBox.checked && !ttBox.checked, tiktok: ttBox.checked, ...cutPayload()});
+      startTracking(t); url.value = ""; grow(); toast(ttBox.checked ? "Запустил нарезку для TikTok — клипы появятся во вкладке «TikTok»" : "Запустил нарезку"); updateRunBox();
     } catch (e) { fail(e); }
   }
   page.append(h("div", {class: "card"}, h("h2", {}, "Новое видео", h("small", {}, tpl ? `шаблон «${tpl.name}»` : `группа «${g.name}»`)),
@@ -300,6 +313,8 @@ function pagePanel(page) {
     h("label", {class: "check", title: "Клипы без баннера попадут во вкладку «TikTok» для ручной выкладки; группа и шаблон не используются"}, ttBox, h("span", {}, "Для ручной выкладки в TikTok (без баннера, клипы появятся во вкладке «TikTok»)")),
     h("label", {class: "check"}, testBox, h("span", {}, "Тестовый прогон — клипы сохранятся в папку тестов и не будут публиковаться"))));
   page.append(h("div", {id: "runbox"}));
+  page.append(h("div", {id: "queuebox"}));
+  updateQueueBox();
   page.append(filesCard());
   const mine = S.clips.filter(c => c.group_id === S.gid), n = mine.length;
   S.sel = new Set([...(S.sel || [])].filter(id => S.clips.some(c => c.id === id && !c.test)));
@@ -353,6 +368,43 @@ function pagePanel(page) {
     : S.tasksMore && older.length ? h("button", {class: "btn sm", style: {marginTop: "10px"}, onclick: () => { S.tasksMore = false; render(); }}, "Свернуть") : null));
   updateRunBox();
 }
+/* ---------- очередь ссылок ---------- */
+function parseLinks(text) {
+  const out = [];
+  for (const line of String(text || "").split(/\r?\n/).map(x => x.trim()).filter(Boolean)) {
+    if ((line.match(/https?:\/\//g) || []).length > 1) out.push(...line.split(/\s+/).filter(Boolean));   // несколько ссылок через пробел
+    else out.push(line);
+  }
+  return out;
+}
+async function queueCall(method, path) {
+  try { S.queue = await api(method, path); updateQueueBox(); } catch (e) { fail(e); }
+}
+function updateQueueBox() {
+  const box = $("#queuebox"); if (!box) return;
+  const q = S.queue || {items: []};
+  if (!q.items.length) { box.replaceChildren(); return; }
+  const waiting = q.items.filter(i => i.status === "pending").length, running = q.items.find(i => i.status === "running");
+  const done = q.items.filter(i => i.status === "done").length, bad = q.items.filter(i => i.status === "error").length;
+  const stat = {pending: "ждёт", running: "нарезается…", done: "готово", error: "ошибка"};
+  const clipsOf = i => { const t = S.tasks.find(x => x.id === i.task_id); return t && t.result && t.result.clips != null ? ` · клипов: ${t.result.clips}` : ""; };
+  const short = u => { try { const x = new URL(u); return x.hostname.replace(/^www\./, "") + x.pathname + x.search; } catch (e) { return u; } };
+  const note = !q.active && waiting ? (q.paused ? "Очередь на паузе" : "Очередь остановлена") : "";
+  box.replaceChildren(h("div", {class: "card"},
+    h("h2", {}, "Очередь ссылок", h("small", {}, `ждут: ${waiting}${running ? " · идёт 1" : ""} · готово: ${done}${bad ? ` · с ошибкой: ${bad}` : ""}`)),
+    h("div", {class: "muted small", style: {marginBottom: "8px"}}, "Ролики обрабатываются по одному. Клипы готовых видео доступны сразу — не нужно ждать конца всей очереди." + (note ? " " + note + "." : "")),
+    h("div", {class: "row", style: {gap: "8px", flexWrap: "wrap", marginBottom: "8px"}},
+      waiting && (q.paused || !q.active) ? h("button", {class: "btn sm primary", onclick: () => queueCall("POST", "/api/queue/start")}, "Продолжить очередь") : null,
+      waiting && q.active && !q.paused ? h("button", {class: "btn sm", title: "Текущее видео дорежется, следующие подождут", onclick: () => queueCall("POST", "/api/queue/pause")}, "Пауза после текущего") : null,
+      done || bad ? h("button", {class: "btn sm", onclick: () => queueCall("POST", "/api/queue/clear")}, "Убрать завершённые") : null),
+    q.items.map(i => h("div", {class: "task", style: {flexWrap: "wrap"}},
+      h("span", {class: "badge " + (i.status === "error" ? "err" : i.status === "done" ? "ok" : ""), style: {flex: "none"}}, stat[i.status] || i.status),
+      h("div", {class: "t"}, h("b", {title: i.url, style: {wordBreak: "break-all"}}, short(i.url)),
+        h("span", {class: "muted small"}, (i.tiktok ? "для TikTok" : "для групп") + (i.mode === "full" ? " · целиком" : "") + (i.status === "done" ? clipsOf(i) : "") + (i.status === "error" && i.error ? ` · ${i.error}` : ""))),
+      i.status === "error" ? h("button", {class: "btn sm", onclick: () => queueCall("POST", `/api/queue/${i.id}/retry`)}, "Повторить") : null,
+      i.status !== "running" ? h("button", {class: "btn sm danger", onclick: () => queueCall("DELETE", `/api/queue/${i.id}`)}, "Убрать") : null))));
+}
+
 function updateRunBox() {
   const box = $("#runbox"); if (!box) return;
   const t = S.tasks.find(x => x.id === S.trackId) || S.tasks.find(x => x.status === "running");
@@ -1408,7 +1460,7 @@ function pageStickerPresets(page) {
 const TT_EXT_HINT = "Расширение не найдено. Установи его один раз: chrome://extensions → «Режим разработчика» → «Загрузить распакованное расширение» → папка browser-extension из проекта. Потом обнови эту страницу (F5).";
 function helperPing(timeout = 700) {
   return new Promise(res => {
-    const on = ev => { if (ev.source === window && ev.data && ev.data.narez === "tiktok-reply" && ev.data.op === "pong") { removeEventListener("message", on); clearTimeout(tm); res(true); } };
+    const on = ev => { if (ev.source === window && ev.data && ev.data.narez === "tiktok-reply" && ev.data.op === "pong") { removeEventListener("message", on); clearTimeout(tm); S.helperVer = ev.data.version || "1.0.0"; res(true); } };
     const tm = setTimeout(() => { removeEventListener("message", on); res(false); }, timeout);
     addEventListener("message", on);
     window.postMessage({narez: "tiktok", op: "ping"}, "*");
@@ -1420,6 +1472,14 @@ function helperLogin(force, timeout = 70000) {
     const tm = setTimeout(() => { removeEventListener("message", on); res({ok: false, error: "Расширение не ответило"}); }, timeout);
     addEventListener("message", on);
     window.postMessage({narez: "tiktok", op: "login", force: !!force}, "*");
+  });
+}
+function helperUpload(job, timeout = 30000) {
+  return new Promise(res => {
+    const on = ev => { if (ev.source === window && ev.data && ev.data.narez === "tiktok-reply" && ev.data.op === "upload") { removeEventListener("message", on); clearTimeout(tm); res(ev.data); } };
+    const tm = setTimeout(() => { removeEventListener("message", on); res({ok: false, error: "Расширение не ответило"}); }, timeout);
+    addEventListener("message", on);
+    window.postMessage({narez: "tiktok", op: "upload", job}, "*");
   });
 }
 async function ttLogin(a, force) {
@@ -1502,7 +1562,9 @@ function pageTikTok(page) {
     if (S.ttPreset) presetSel.value = S.ttPreset;
     if (S.ttSticker) stickerSel.value = S.ttSticker;
     const used = [...new Set(T.clips.map(c => c.preset).filter(Boolean))];
-    note.textContent = T.clips.length ? `Клипов: ${T.clips.length}. ` + (used.length ? `Сейчас применён пресет: ${used.join(", ")}.` : "Пресет не применён — у всех клипов только оригинал.") : "";
+    const nf = T.clips.filter(c => c.filler && c.filler.position).length;
+    drawFiles();
+    note.textContent = T.clips.length ? `Клипов: ${T.clips.length}. ` + (used.length ? `Сейчас применён пресет: ${used.join(", ")}.` : "Пресет не применён.") + (nf ? ` Со вставкой: ${nf}.` : "") : "";
     const off = S.ttOff || (S.ttOff = new Set());
     const sel = {has: id => !off.has(id), toggle: (id, on) => { on ? off.delete(id) : off.add(id); count(); }};
     list.replaceChildren(...T.clips.map(c => ttCard(c, sel)));
@@ -1516,6 +1578,19 @@ function pageTikTok(page) {
   const count = () => { const n = chosen().length; selInfo.textContent = T.clips.length ? `Выбрано клипов: ${n} из ${T.clips.length}` : ""; };
   const selAll = h("button", {class: "btn sm", onclick: () => { (S.ttOff || (S.ttOff = new Set())).clear(); draw(); }}, "Выбрать все");
   const selNone = h("button", {class: "btn sm", onclick: () => { S.ttOff = new Set(T.clips.map(c => c.id)); draw(); }}, "Снять выбор");
+  const files = () => (S.fillers && S.fillers.files) || [];
+  const fPos = h("select", {style: {minWidth: "170px"}}, [["bottom", "Вставка снизу"], ["top", "Вставка сверху"]].map(([v, t]) => h("option", {value: v}, t)));
+  const fFile = h("select", {style: {minWidth: "220px"}});
+  const drawFiles = () => { const v = fFile.value; fFile.replaceChildren(h("option", {value: ""}, "Случайное видео"), ...files().map(f => h("option", {value: f.name}, f.name))); fFile.value = v; };
+  const fApply = h("button", {class: "btn primary", onclick: () => run(async () => {
+    const ids = need(); if (!ids) return;
+    if (!files().length) return toast("В папке вставок нет видео — открой вкладку «Вставки»", "err");
+    const t = await api("POST", "/api/tiktok/filler", {clip_ids: ids, position: fPos.value, file: fFile.value}); startTracking(t);
+    toast(`Добавляю вставку к выбранным клипам (${ids.length})… баннеры и стикеры на них сохранятся`); }) }, "Применить вставку к выбранным");
+  const fRemove = h("button", {class: "btn", title: "Убрать вставку: баннеры и стикеры клипа останутся", onclick: () => run(async () => {
+    const ids = need(); if (!ids) return;
+    const t = await api("POST", "/api/tiktok/filler", {clip_ids: ids, position: ""}); startTracking(t);
+    toast("Убираю вставку у выбранных клипов…"); }) }, "Убрать вставку у выбранных");
   const need = () => { const ids = chosen(); if (!ids.length) { toast("Отметь галочками клипы, к которым это относится", "err"); return null; } return ids; };
   presetSel.onchange = () => { S.ttPreset = Number(presetSel.value) || null; };
   stickerSel.onchange = () => { S.ttSticker = Number(stickerSel.value) || null; };
@@ -1534,10 +1609,13 @@ function pageTikTok(page) {
   page.append(h("div", {class: "card tt-block"}, h("h2", {}, "Пресеты для всех клипов", h("small", {}, "баннеры и/или стикеры; остаются оригинал + последний вариант")),
       h("div", {class: "row", style: {gap: "10px", flexWrap: "wrap"}}, presetSel, stickerSel, apply, reset, note),
       h("div", {class: "row", style: {gap: "8px", flexWrap: "wrap", marginTop: "8px", alignItems: "center"}}, selAll, selNone, selInfo)),
+    h("div", {class: "card tt-block"}, h("h2", {}, "Видео-вставка для выбранных клипов", h("small", {}, "клип + вставка + полоска с названием; пресеты баннеров и стикеров на клипах сохраняются")),
+      h("div", {class: "row", style: {gap: "10px", flexWrap: "wrap"}}, fPos, fFile, fApply, fRemove)),
     empty, list, h("div", {class: "row", style: {justifyContent: "flex-end"}}, del), ttLogCard());
   draw();
   api("GET", "/api/presets").then(p => { S.presets = p; draw(); }).catch(() => {});
   loadStickers().then(draw);
+  loadFillers().then(draw);
   loadTikTok().then(() => { if (S.page === "tiktok" && page.isConnected) { T.clips = S.tt.clips; draw(); } });
 }
 function ttCard(c, sel) {
@@ -1546,9 +1624,11 @@ function ttCard(c, sel) {
   const video = h("video", {controls: true, playsinline: true, preload: "metadata", poster: `/api/clips/${c.id}/thumb`});
   const setSrc = () => { video.src = `/api/clips/${c.id}/video?${useP ? "variant=final&" : ""}t=${Date.now()}`; };
   const lenEl = h("div", {class: "tt-len small", title: "Длина видео в минутах:секундах"});
+  const fl = c.filler && c.filler.position ? c.filler : null;
+  const flEl = fl ? h("div", {class: "tt-len small"}, `Вставка ${fl.position === "top" ? "сверху" : "снизу"}${fl.picked || fl.file ? ": " + (fl.picked || fl.file) : ""}`) : null;
   const showLen = () => { const v = useP && c.length_preset ? c.length_preset : (c.length_original || c.duration); lenEl.textContent = `Длина: ${fmtMS(v)}`; };
   setSrc(); showLen();
-  const seg = h("div", {class: "seg"}, [["o", "Оригинал"], ["p", c.preset ? `С пресетом «${c.preset}»` : "С пресетом"]].map(([k, t]) =>
+  const seg = h("div", {class: "seg"}, [["o", "Оригинал"], ["p", c.preset ? `С пресетом «${c.preset}»` : (c.filler && c.filler.position ? "Со вставкой" : "С пресетом")]].map(([k, t]) =>
     h("button", {"data-k": k, disabled: k === "p" && !hasP, class: (k === "p") === useP ? "on" : "", onclick: e => { useP = k === "p"; seg.querySelectorAll("button").forEach(b => b.classList.toggle("on", (b.dataset.k === "p") === useP)); setSrc(); showLen(); }}, t)));
   const title = h("input", {type: "text", value: c.title});
   const desc = h("textarea", {rows: 5}, c.description);
@@ -1560,16 +1640,40 @@ function ttCard(c, sel) {
   [title, desc, tags].forEach(el => el.addEventListener("change", save));
   const curPath = () => useP ? c.path_preset : c.path_original;
   const full = () => (desc.value.trim() + (tags.value.trim() ? "\n\n" + tags.value.trim() : "")).trim();
+  const whenMap = S.ttWhen || (S.ttWhen = {});
+  const when = h("input", {type: "datetime-local", step: "300", value: whenMap[c.id] || "", title: "Когда выпустить ролик (необязательно). Время — по часам этого компьютера; TikTok принимает примерно от 15 минут до 10 дней вперёд", onchange: () => { whenMap[c.id] = when.value; }});
+  const accs = (S.tt && S.tt.accounts) || [];
+  if (S.ttAcc == null && accs.length === 1) S.ttAcc = accs[0].id;
+  const accSel = h("select", {title: "В какой TikTok-аккаунт заходить перед загрузкой. Если он уже открыт в браузере — повторный вход не нужен; если открыт другой — расширение переключится само", onchange: () => { S.ttAcc = accSel.value ? Number(accSel.value) : null; }},
+    h("option", {value: ""}, accs.length ? "аккаунт: как сейчас в браузере" : "аккаунтов нет — добавь выше"),
+    accs.map(a => h("option", {value: String(a.id), selected: a.id === S.ttAcc}, a.label)));
+  const upload = h("button", {class: "btn primary", title: "Откроет TikTok Studio в этом браузере, вставит файл и описание и выставит время. «Опубликовать» нажимаешь сам", onclick: async () => {
+    await save();
+    if (!(await helperPing())) return dialog(h("div", {}, h("h3", {}, "Нужно расширение браузера"), h("div", {class: "muted"}, TT_EXT_HINT)), [{text: "Понятно", cls: "primary"}]);
+    if ((S.helperVer || "1.0.0").split(".").map(Number).reduce((a, n, i) => a || (n - [1, 1, 0][i]), 0) < 0)
+      return dialog(h("div", {}, h("h3", {}, "Расширение устарело"), h("div", {class: "muted"}, "Для загрузки в TikTok Studio нужна версия расширения 1.1 или новее. Открой chrome://extensions, нажми значок обновления (⟳) на карточке narez и обнови эту страницу (F5).")), [{text: "Понятно", cls: "primary"}]);
+    if (when.value) {
+      const ms = new Date(when.value).getTime() - Date.now();
+      if (!(ms > 10 * 60 * 1000 && ms < 11 * 24 * 3600 * 1000)) toast("Внимание: TikTok планирует примерно от 15 минут до 10 дней вперёд — проверь время в Studio", "err");
+    }
+    const edited = !!(useP && c.path_preset);
+    const acc = accs.find(a => a.id === S.ttAcc) || null;
+    if (acc) { try { await api("POST", `/api/tiktok/accounts/${acc.id}/arm`); } catch (e) { return fail(e); } }
+    const r = await helperUpload({clip_id: c.id, variant: edited ? "final" : "original", caption: full() || title.value, schedule: when.value || "", account_id: acc ? acc.id : null});
+    if (!r.ok) return toast(r.error || "Не удалось открыть TikTok Studio", "err");
+    toast((acc ? `Аккаунт «${acc.label}»: переключаю вход в браузере и открываю TikTok Studio` : "Открыл TikTok Studio в текущем аккаунте браузера") + ". Файл, описание" + (when.value ? " и время" : "") + " вставятся сами; «Опубликовать» нажми сам");
+  }}, "В TikTok Studio");
   const pick = h("input", {type: "checkbox", checked: sel ? sel.has(c.id) : true, title: "Применять к этому клипу пресеты и удалять его вместе с выбранными", onchange: () => sel && sel.toggle(c.id, pick.checked)});
   return h("div", {class: "card tt-card"},
     h("div", {class: "tt-frame"}, h("label", {class: "tt-pick small"}, pick, " в выборке"), video),
     h("div", {class: "tt-body"},
       c.preset || hasP ? seg : h("div", {class: "muted small"}, "Только оригинал (пресет не применён)"),
-      lenEl,
+      lenEl, flEl,
       h("label", {class: "muted small"}, "Название"), title,
       h("label", {class: "muted small"}, "Описание"), desc,
       h("label", {class: "muted small"}, "Теги"), tags,
       h("div", {class: "muted small tt-path", title: "Путь к файлу"}, curPath()),
+      h("div", {class: "row", style: {gap: "6px", flexWrap: "wrap", alignItems: "center", margin: "4px 0 8px"}}, h("span", {class: "muted small"}, "Аккаунт:"), accSel, h("span", {class: "muted small"}, "Выход:"), when, upload),
       h("div", {class: "row", style: {gap: "6px", flexWrap: "wrap"}},
         h("button", {class: "btn primary", onclick: async () => { await save(); ttCopyAll({...c, title: title.value, text: full(), path_original: c.path_original, path_preset: c.path_preset}, useP); }}, "Скопировать всё"),
         h("button", {class: "btn sm", onclick: () => ttCopy(curPath(), "путь к файлу")}, "Путь"),
