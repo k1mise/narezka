@@ -24,6 +24,7 @@ CREATE TABLE IF NOT EXISTS tiktok_accounts(
   id INTEGER PRIMARY KEY, label TEXT NOT NULL, login TEXT DEFAULT '', password TEXT DEFAULT '', note TEXT DEFAULT '',
   created TEXT DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE IF NOT EXISTS presets(id INTEGER PRIMARY KEY, name TEXT UNIQUE NOT NULL, data TEXT DEFAULT '{}');
+CREATE TABLE IF NOT EXISTS sticker_presets(id INTEGER PRIMARY KEY, name TEXT UNIQUE NOT NULL, data TEXT DEFAULT '{}');
 CREATE TABLE IF NOT EXISTS templates(id INTEGER PRIMARY KEY, name TEXT UNIQUE NOT NULL, data TEXT DEFAULT '{}');
 CREATE TABLE IF NOT EXISTS proxies(
   id INTEGER PRIMARY KEY, url TEXT UNIQUE NOT NULL, status TEXT DEFAULT 'new', ip TEXT DEFAULT '', country TEXT DEFAULT '',
@@ -32,6 +33,13 @@ CREATE TABLE IF NOT EXISTS proxies(
 CREATE TABLE IF NOT EXISTS deferred(
   id INTEGER PRIMARY KEY, clip_id INTEGER, account_id INTEGER, run_at TEXT NOT NULL,
   status TEXT DEFAULT 'wait', error TEXT DEFAULT '', created TEXT DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS watch_channels(
+  id INTEGER PRIMARY KEY, url TEXT UNIQUE NOT NULL, name TEXT DEFAULT '', error TEXT DEFAULT '',
+  checked_at REAL DEFAULT 0, added REAL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS watch_videos(
+  id TEXT NOT NULL, channel_id INTEGER NOT NULL REFERENCES watch_channels(id) ON DELETE CASCADE,
+  url TEXT, title TEXT, channel_name TEXT DEFAULT '', thumb TEXT DEFAULT '', duration REAL,
+  views INTEGER, likes INTEGER, uploaded REAL, updated REAL, PRIMARY KEY(id, channel_id));
 CREATE TABLE IF NOT EXISTS publications(
   id INTEGER PRIMARY KEY, clip_id INTEGER, account_id INTEGER, group_id INTEGER,
   platform TEXT, video_id TEXT, url TEXT, title TEXT, thumb TEXT DEFAULT '',
@@ -44,10 +52,11 @@ MIGRATIONS = {
     "jobs": {"source_path": "TEXT DEFAULT ''", "test": "INTEGER DEFAULT 0"},
     "clips": {"group_id": "INTEGER", "tags": "TEXT DEFAULT ''", "banner": "TEXT DEFAULT ''", "banner_applied": "TEXT DEFAULT ''",
               "final_path": "TEXT DEFAULT ''", "thumb": "TEXT DEFAULT ''", "publish_at": "TEXT DEFAULT ''",
-              "filler": "TEXT DEFAULT ''", "filler_path": "TEXT DEFAULT ''", "filler_applied": "TEXT DEFAULT ''", "tt_preset": "TEXT DEFAULT ''"},
+              "filler": "TEXT DEFAULT ''", "filler_path": "TEXT DEFAULT ''", "filler_applied": "TEXT DEFAULT ''", "tt_preset": "TEXT DEFAULT ''",
+              "stickers": "TEXT DEFAULT ''", "sticker_path": "TEXT DEFAULT ''", "sticker_applied": "TEXT DEFAULT ''"},
     "publications": {"avg_pct": "REAL", "avg_sec": "REAL"},    # удержание: средний % досмотра и средняя длительность просмотра (YouTube Analytics)
 }
-CLIP_FIELDS = {"group_id", "path", "title", "reason", "tags", "banner", "banner_applied", "final_path", "thumb", "status", "publish_at", "filler", "filler_path", "filler_applied", "tt_preset"}
+CLIP_FIELDS = {"group_id", "path", "title", "reason", "tags", "banner", "banner_applied", "final_path", "thumb", "status", "publish_at", "filler", "filler_path", "filler_applied", "tt_preset", "stickers", "sticker_path", "sticker_applied"}
 
 
 class DB:
@@ -171,6 +180,55 @@ class DB:
     # --- TikTok: ручная выкладка ---
     def tiktok_clips(self):
         return self.c.execute("SELECT * FROM clips WHERE status='tiktok' ORDER BY id").fetchall()
+
+    # ---------- слежение за каналами ----------
+    def watch_channels(self):
+        return self.c.execute("""SELECT c.*, (SELECT COUNT(*) FROM watch_videos v WHERE v.channel_id=c.id) AS videos
+                                 FROM watch_channels c ORDER BY c.id""").fetchall()
+
+    def watch_channel(self, ch_id: int):
+        return self.c.execute("SELECT * FROM watch_channels WHERE id=?", (ch_id,)).fetchone()
+
+    def add_watch_channel(self, url: str) -> int | None:
+        """None — такой канал уже есть."""
+        import time as _t
+        try:
+            cur = self.c.execute("INSERT INTO watch_channels(url, added) VALUES(?,?)", (url, _t.time()))
+        except sqlite3.IntegrityError:
+            return None
+        self.c.commit()
+        return cur.lastrowid
+
+    def update_watch_channel(self, ch_id: int, **f) -> None:
+        keys = [k for k in f if k in ("name", "error", "checked_at", "url")]
+        if keys:
+            self.c.execute(f"UPDATE watch_channels SET {', '.join(k + '=?' for k in keys)} WHERE id=?", [f[k] for k in keys] + [ch_id])
+            self.c.commit()
+
+    def delete_watch_channel(self, ch_id: int) -> None:
+        self.c.execute("DELETE FROM watch_videos WHERE channel_id=?", (ch_id,))
+        self.c.execute("DELETE FROM watch_channels WHERE id=?", (ch_id,))
+        self.c.commit()
+
+    def watch_known(self, ch_id: int) -> dict:
+        return {r["id"]: r for r in self.c.execute("SELECT id, uploaded FROM watch_videos WHERE channel_id=?", (ch_id,))}
+
+    def upsert_watch_video(self, ch_id: int, v: dict) -> None:
+        self.c.execute("""INSERT INTO watch_videos(id, channel_id, url, title, channel_name, thumb, duration, views, likes, uploaded, updated)
+                          VALUES(?,?,?,?,?,?,?,?,?,?,?)
+                          ON CONFLICT(id, channel_id) DO UPDATE SET url=excluded.url, title=excluded.title, channel_name=excluded.channel_name,
+                            thumb=excluded.thumb, duration=excluded.duration, views=excluded.views, likes=excluded.likes,
+                            uploaded=excluded.uploaded, updated=excluded.updated""",
+                       (v["id"], ch_id, v.get("url"), v.get("title"), v.get("channel") or "", v.get("thumb") or "", v.get("duration"),
+                        v.get("views"), v.get("likes"), v.get("ts"), v.get("updated")))
+        self.c.commit()
+
+    def prune_watch_videos(self, cutoff: float) -> None:
+        self.c.execute("DELETE FROM watch_videos WHERE uploaded IS NOT NULL AND uploaded < ?", (cutoff,))
+        self.c.commit()
+
+    def watch_feed(self, cutoff: float):
+        return self.c.execute("SELECT * FROM watch_videos WHERE uploaded >= ? ORDER BY uploaded DESC", (cutoff,)).fetchall()
 
     def tiktok_accounts(self):
         return self.c.execute("SELECT * FROM tiktok_accounts ORDER BY id").fetchall()
@@ -305,6 +363,26 @@ class DB:
 
     def delete_preset(self, preset_id: int):
         self.c.execute("DELETE FROM presets WHERE id=?", (preset_id,))
+        self.c.commit()
+
+    def sticker_presets(self):
+        return self.c.execute("SELECT * FROM sticker_presets ORDER BY name COLLATE NOCASE").fetchall()
+
+    def sticker_preset(self, preset_id: int):
+        return self.c.execute("SELECT * FROM sticker_presets WHERE id=?", (preset_id,)).fetchone()
+
+    def save_sticker_preset(self, name: str, data: dict, preset_id: int | None = None) -> int:
+        blob = json.dumps(data, ensure_ascii=False)
+        if preset_id:
+            self.c.execute("UPDATE sticker_presets SET name=?, data=? WHERE id=?", (name, blob, preset_id))
+            self.c.commit()
+            return preset_id
+        self.c.execute("INSERT INTO sticker_presets(name,data) VALUES(?,?) ON CONFLICT(name) DO UPDATE SET data=excluded.data", (name, blob))
+        self.c.commit()
+        return self.c.execute("SELECT id FROM sticker_presets WHERE name=?", (name,)).fetchone()["id"]
+
+    def delete_sticker_preset(self, preset_id: int):
+        self.c.execute("DELETE FROM sticker_presets WHERE id=?", (preset_id,))
         self.c.commit()
 
     def job(self, job_id: int):

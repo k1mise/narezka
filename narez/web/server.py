@@ -22,6 +22,7 @@ from .. import banner as bn
 from .. import filler as filler_mod
 from .. import stickers as stk
 from .. import schedule, service
+from .. import watch as wt
 from ..cleanup import discard_clip, sweep_sources
 from ..config import FOLDER_TITLES, folder, load_config
 from ..editor import make_thumb
@@ -107,6 +108,10 @@ class QueueIn(CutIn):
     test: bool = False
     template_id: Optional[int] = None
     tiktok: bool = False
+
+
+class WatchAddIn(BaseModel):
+    urls: list[str]
 
 
 class ProxyAddIn(BaseModel):
@@ -699,6 +704,106 @@ def create_app(cfg: dict | None = None) -> FastAPI:
             q_save()
         q_kick()
         return q_public()
+
+    # ---------- каналы: свежие видео чужих аккаунтов ----------
+    def watch_days() -> float:
+        return float((cfg.get("watch") or {}).get("days", 10) or 10)
+
+    def watch_refresh_fn(only_new: bool):
+        def fn(log):
+            db2 = DB(cfg["paths"]["db"], init=False)
+            days = watch_days()
+            limit = int((cfg.get("watch") or {}).get("per_channel", 40) or 40)
+            done_ids, total, bad = set(), 0, 0
+            first = True
+            while True:     # каналы, добавленные во время обновления, подхватываем в этом же проходе
+                chs = [c for c in db2.watch_channels() if c["id"] not in done_ids and (c["checked_at"] == 0 or (first and not only_new))]
+                first = False
+                if not chs:
+                    break
+                for c in chs:
+                    done_ids.add(c["id"])
+                    n = wt.refresh_channel(db2, c, days, log, limit=limit)
+                    total += n
+                    bad += 1 if (db2.watch_channel(c["id"]) or {"error": ""})["error"] else 0
+            db2.prune_watch_videos(time.time() - (days + 30) * 86400)   # лента показывает только окно days, старые записи хранятся ещё месяц, чтобы не запрашивать их заново
+            return {"channels": len(done_ids), "videos": total, "errors": bad}
+        return fn
+
+    def start_watch(only_new: bool):
+        try:
+            return tasks.start("watch", "Обновление каналов", watch_refresh_fn(only_new), exclusive=True).public(after=0)
+        except Busy:
+            return None
+
+    def watch_view(d: DB) -> dict:
+        days = watch_days()
+        chans = [{"id": c["id"], "url": c["url"], "name": c["name"], "error": c["error"], "checked_at": c["checked_at"], "videos": c["videos"]}
+                 for c in d.watch_channels()]
+        vids = [{"id": v["id"], "channel_id": v["channel_id"], "url": v["url"], "title": v["title"], "channel": v["channel_name"], "thumb": v["thumb"],
+                 "duration": v["duration"], "views": v["views"], "likes": v["likes"], "uploaded": v["uploaded"], "updated": v["updated"]}
+                for v in d.watch_feed(time.time() - days * 86400)]
+        return {"days": days, "channels": chans, "videos": vids, "running": tasks.running("watch"),
+                "updated": max([c["checked_at"] for c in chans if not c["error"]] or [0])}
+
+    @app.get("/api/watch")
+    def watch_get(d: DB = Depends(get_db)):
+        return watch_view(d)
+
+    @app.post("/api/watch/channels")
+    def watch_add(body: WatchAddIn, d: DB = Depends(get_db)):
+        raw = [u.strip() for u in body.urls if u and u.strip()]
+        if not raw:
+            raise HTTPException(400, "Нет ссылок")
+        if len(raw) > 200:
+            raise HTTPException(400, "За раз можно добавить до 200 каналов")
+        added, rejected = 0, []
+        for u in raw:
+            try:
+                url = wt.channel_url(u)
+            except wt.WatchError as e:
+                rejected.append({"url": u, "error": str(e)})
+                continue
+            if d.add_watch_channel(url) is None:
+                rejected.append({"url": u, "error": "Этот канал уже добавлен"})
+            else:
+                added += 1
+        task = start_watch(only_new=True) if added else None
+        return {**watch_view(d), "added": added, "rejected": rejected, "task": task}
+
+    @app.delete("/api/watch/channels/{ch_id}")
+    def watch_remove(ch_id: int, d: DB = Depends(get_db)):
+        if not d.watch_channel(ch_id):
+            raise HTTPException(404, "Канал не найден")
+        d.delete_watch_channel(ch_id)
+        return watch_view(d)
+
+    @app.post("/api/watch/refresh")
+    def watch_refresh(d: DB = Depends(get_db)):
+        if not d.watch_channels():
+            raise HTTPException(400, "Сначала добавь каналы")
+        t = start_watch(only_new=False)
+        if t is None:
+            raise HTTPException(409, "Обновление уже идёт — дождись его завершения.")
+        return t
+
+    def watch_auto() -> None:
+        """Раз в несколько часов (пока программа открыта) сама обновляет каналы. [watch] auto_hours = 0 — выключить."""
+        while True:
+            time.sleep(120)
+            try:
+                hours = float((cfg.get("watch") or {}).get("auto_hours", 3) or 0)
+                if hours <= 0:
+                    continue
+                d = DB(cfg["paths"]["db"], init=False)
+                chs = d.watch_channels()
+                if chs and not tasks.running("watch") and time.time() - max(c["checked_at"] for c in chs) > hours * 3600:
+                    start_watch(only_new=False)
+            except Exception:
+                pass
+
+    if (cfg.get("watch") or {}).get("auto_hours", 3) not in (0, "0", False):
+        threading.Thread(target=watch_auto, daemon=True, name="narez-watch").start()
 
     @app.get("/api/tasks")
     def task_list():
